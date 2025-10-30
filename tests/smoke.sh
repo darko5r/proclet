@@ -1,5 +1,3 @@
-mkdir -p tests
-cat > tests/smoke.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 exe="${1:-target/debug/proclet}"
@@ -36,5 +34,3 @@ echo "exit=$code (expect 7)"
 test "$code" -eq 7
 
 echo "OK ✅"
-SH
-chmod +x tests/smoke.sh
