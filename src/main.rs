@@ -1,35 +1,29 @@
-use clap::Parser;
-use std::ffi::CString;
-use std::os::raw::c_char;
-use std::process::exit;
+use proclet::{cstrings, run_pid_mount};
+use std::env;
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "proclet",
-    about = "Tiny Linux process sandbox using PID + mount namespaces with a fresh /proc.",
-    version
-)]
-struct Cli {
-    /// Command to run inside the sandbox (use `--` before the command)
-    #[arg(trailing_var_arg = true, required = true)]
-    cmd: Vec<String>,
+fn usage() -> ! {
+    eprintln!("Usage: proclet -- <command> [args...]");
+    std::process::exit(2);
 }
 
-mod ffi;
 fn main() {
-    let cli = Cli::parse();
+    let args = env::args().collect::<Vec<_>>();
+    let dashdash = args.iter().position(|a| a == "--").unwrap_or_else(|| usage());
 
-    // Build argv as C strings + trailing null
-    let cstrings: Vec<CString> = cli
-        .cmd
-        .iter()
-        .map(|s| CString::new(s.as_str()).expect("nul in arg"))
-        .collect();
+    let cmd = &args[dashdash + 1..];
+    if cmd.is_empty() {
+        usage();
+    }
 
-    // Build **argv (null-terminated)
-    let mut argv_ptrs: Vec<*const c_char> = cstrings.iter().map(|s| s.as_ptr()).collect();
-    argv_ptrs.push(std::ptr::null());
+    // use cstrings so the import isn't unused
+    let cargs = cstrings(&cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
-    let code = ffi::run_pid_mount(argv_ptrs.as_ptr()) as i32;
-    exit(code);
+    match run_pid_mount(&cargs) {
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            eprintln!("proclet: failed to start: {e}");
+            std::process::exit(1);
+        }
+    }
 }
+
