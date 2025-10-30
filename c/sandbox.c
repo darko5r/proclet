@@ -1,23 +1,48 @@
 #define _GNU_SOURCE
 #include <sched.h>
+#include <signal.h>
+#include <sys/mount.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
+#include <stdio.h>
 #include <string.h>
+#include <errno.h>
 
-// Child runs inside the new PID namespace
+#ifndef STACK_SIZE
+#define STACK_SIZE (1024 * 1024) // 1 MiB
+#endif
+
 static int child_fn(void *arg) {
     char *const *argv = (char *const *)arg;
-    // NOTE: no chroot/mount yet — just exec
-    execvp(argv[0], (char *const *)argv);
+
+    // make mounts private so changes don’t leak back
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == -1) {
+        perror("mount(MS_PRIVATE)");
+        return 1;
+    }
+
+    // ensure /proc exists
+    if (access("/proc", F_OK) == -1) {
+        perror("access(/proc)");
+        return 1;
+    }
+
+    // mount a fresh proc for the new PID namespace
+    if (mount("proc", "/proc", "proc",
+              MS_NOSUID | MS_NOEXEC | MS_NODEV, NULL) == -1) {
+        perror("mount(proc)");
+        return 1;
+    }
+
+    // execute target
+    execvp(argv[0], argv);
     perror("execvp");
     return 127;
 }
 
-int run_pid_ns(char *const argv[]) {
-    const int STACK_SIZE = 1024 * 1024;
+int proclet_run_pid_mount(char *const argv[]) {
+    // allocate child stack
     void *stack = malloc(STACK_SIZE);
     if (!stack) {
         perror("malloc");
@@ -25,8 +50,10 @@ int run_pid_ns(char *const argv[]) {
     }
     void *stack_top = (char *)stack + STACK_SIZE;
 
-    // Create new PID namespace; child will be PID 1 there
-    pid_t child = clone(child_fn, stack_top, CLONE_NEWPID | SIGCHLD, (void*)argv); 
+    // CLONE_NEWNS: mount namespace, CLONE_NEWPID: new PID ns
+    int flags = CLONE_NEWNS | CLONE_NEWPID | SIGCHLD;
+
+    pid_t child = clone(child_fn, stack_top, flags, (void *)argv);
     if (child == -1) {
         perror("clone");
         free(stack);
@@ -42,9 +69,6 @@ int run_pid_ns(char *const argv[]) {
     free(stack);
 
     if (WIFEXITED(status)) return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) {
-        fprintf(stderr, "child terminated by signal %d\n", WTERMSIG(status));
-        return 128 + WTERMSIG(status);
-    }
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 1;
 }
