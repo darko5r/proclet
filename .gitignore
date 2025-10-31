@@ -1,33 +1,23 @@
-# Created by https://www.toptal.com/developers/gitignore/api/rust,c
-# Edit at https://www.toptal.com/developers/gitignore?templates=rust,c
-
-# =====================================
-# Rust project
-# =====================================
-
-# Compiled output
+# =========================
+# Rust / Cargo
+# =========================
 /target/
 debug/
+**/*.rs.bk           # rustfmt backups
 
-# Cargo metadata
-Cargo.lock       # include for apps, ignore for libraries
-**/*.rs.bk       # rustfmt backups
-
-# Logs and temporary files
+# =========================
+# Logs / temp
+# =========================
 *.log
 *.tmp
 *.swp
 *.swo
+*~
 
-# OS / editor files
+# =========================
+# OS / Editors
+# =========================
 .DS_Store
 .idea/
 .vscode/
 *.iml
-
-# Backup files
-*~
-
-# MSVC Windows builds of rustc generate these, which store debugging information
-
-# End of https://www.toptal.com/developers/gitignore/api/rust
