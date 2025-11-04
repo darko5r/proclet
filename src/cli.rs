@@ -2,6 +2,8 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum Ns {
+    /// New USER namespace (map real uid/gid -> root inside)
+    User,
     /// New PID namespace (child becomes PID 1)
     Pid,
     /// New mount namespace (private mounts + fresh /proc)
@@ -14,7 +16,8 @@ pub enum Ns {
 #[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
 pub struct Cli {
     /// Namespace(s) to enable
-    #[arg(long = "ns", value_enum, num_args=1.., value_delimiter=',', default_values_t = [Ns::Pid, Ns::Mnt])]
+    #[arg(long = "ns", value_enum, num_args=1.., value_delimiter=',',
+        default_values_t = [Ns::User, Ns::Pid, Ns::Mnt])]
     pub ns: Vec<Ns>,
 
     /// Do NOT mount a fresh /proc (only valid if Mnt is enabled)
@@ -28,6 +31,14 @@ pub struct Cli {
     /// Set hostname inside PID/MNT ns (cosmetic; requires MNT ns)
     #[arg(long)]
     pub hostname: Option<String>,
+
+    /// Bind-mounts: --bind /host:/inside[:ro] (repeatable)
+    #[arg(long, value_delimiter=',')]
+    pub bind: Vec<String>,
+
+    /// Make root filesystem read-only (remount / as MS_RDONLY)
+    #[arg(long)]
+    pub readonly: bool,
 
     /// Command to run (use `--` before it)
     #[arg(last = true, required = true)]
