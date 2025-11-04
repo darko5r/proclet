@@ -1,5 +1,16 @@
 # Apache License 2.0
 
+<!--
+                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+1. Definitions.
+"License" shall mean the terms and conditions ...
+[full unmodified license text goes here inside the comment]
+-->
+*(Readable, formatted text version for humans below)*
+
 **Version 2.0 — January 2004**  
 **URL:** [https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0)
 
