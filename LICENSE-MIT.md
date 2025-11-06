@@ -1,10 +1,10 @@
+## MIT License
+
+Copyright (c) 2025 darko5r
+
 <div align="justify">
 
-	## MIT License
-
-	Copyright (c) 2025 darko5r
-
-    Permission is hereby granted, free of charge, to any person obtaining a copy
+    <p style="text-indent:2em;">Permission is hereby granted, free of charge, to any person obtaining a copy</p>
     of this software and associated documentation files (the “Software”), to deal
     in the Software without restriction, including without limitation the rights
     to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
