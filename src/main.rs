@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#[cfg(not(feature = "core"))]
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`.");
+
 mod cli;
 
 use clap::Parser;
@@ -21,43 +24,91 @@ use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
 use std::ffi::CString;
 
+// ---------- feature gates as booleans ----------
+#[cfg(feature = "net")]
+const FEATURE_NET: bool = true;
+#[cfg(not(feature = "net"))]
+const FEATURE_NET: bool = false;
+
+#[cfg(feature = "uts")]
+const FEATURE_UTS: bool = true;
+#[cfg(not(feature = "uts"))]
+const FEATURE_UTS: bool = false;
+
+#[cfg(feature = "debug")]
+macro_rules! dbgln {
+    ($($t:tt)*) => { eprintln!($($t)*); }
+}
+#[cfg(not(feature = "debug"))]
+macro_rules! dbgln {
+    ($($t:tt)*) => {};
+}
+
+// ---------- helpers ----------
 fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
     // Syntax: /host:/inside[:ro]
-    b.iter().filter_map(|spec| {
-        let parts = spec.split(':').collect::<Vec<_>>();
-        if parts.len() < 2 { return None; }
-        let ro = parts.len() >= 3 && parts[2].eq_ignore_ascii_case("ro");
-        Some((parts[0].into(), parts[1].into(), ro))
-    }).collect()
+    b.iter()
+        .filter_map(|spec| {
+            let parts = spec.split(':').collect::<Vec<_>>();
+            if parts.len() < 2 {
+                return None;
+            }
+            let ro = parts.len() >= 3 && parts[2].eq_ignore_ascii_case("ro");
+            Some((parts[0].into(), parts[1].into(), ro))
+        })
+        .collect()
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if cli.ns.iter().any(|n| matches!(n, Ns::Net)) {
-        eprintln!("proclet: --ns net is not implemented yet (placeholder)");
+    // --- Validate feature-dependent flags up front ---
+    if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
+        eprintln!("proclet: this binary was built without the `net` feature.\n\
+                   Rebuild with: cargo build --features net\n\
+                   (requested: --ns net)");
         std::process::exit(64); // EX_USAGE
     }
 
-    let cargs: Vec<CString> = cstrings(
-        &cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-    );
+    if cli.hostname.is_some() && !FEATURE_UTS {
+        eprintln!("proclet: setting hostname requires the `uts` feature.\n\
+                   Rebuild with: cargo build --features uts\n\
+                   (requested: --hostname ...)");
+        std::process::exit(64); // EX_USAGE
+    }
+
+    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
         eprintln!("proclet: currently requires ns=pid,mnt (others coming soon)");
         std::process::exit(64);
     }
 
+    // Optional debug dump (only if built with --features debug)
+    dbgln!(
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}",
+        use_user,
+        use_pid,
+        use_mnt,
+        _use_net,
+        cli.readonly,
+        cli.no_proc,
+        cli.workdir,
+        cli.hostname,
+        cli.bind
+    );
+
     let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
 
-        // new:
+        // existing toggles
         use_user,
         use_pid,
         use_mnt,

@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+//! Core sandbox engine
+
+// Optional safety net: fail if someone builds without `core`.
+#[cfg(not(feature = "core"))]
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`.");
+
 use nix::{
     errno::Errno,
     mount::{mount, umount2, MntFlags, MsFlags},
@@ -29,6 +35,16 @@ use std::{
 use std::fs::OpenOptions;
 use std::io::Write;
 
+// ---- debug helper (enabled only with `--features debug`) ----
+#[cfg(feature = "debug")]
+macro_rules! dbgln {
+    ($($t:tt)*) => { eprintln!($($t)*); }
+}
+#[cfg(not(feature = "debug"))]
+macro_rules! dbgln {
+    ($($t:tt)*) => {};
+}
+
 fn write_file(path: &str, s: &str) -> Result<(), Errno> {
     let to_errno = |e: std::io::Error| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO));
     let mut f = OpenOptions::new().write(true).open(path).map_err(to_errno)?;
@@ -43,10 +59,11 @@ fn enter_userns_map_root() -> Result<(), Errno> {
 
     // If running as real root, just don't use a user namespace.
     if euid == 0 {
+        dbgln!("proclet(debug): skipping userns (already root)");
         return Ok(());
     }
 
-    // Create the user namespace
+    dbgln!("proclet(debug): unshare(CLONE_NEWUSER)");
     unshare(CloneFlags::CLONE_NEWUSER)?;
 
     // On unprivileged paths, kernel requires setgroups=deny before gid_map
@@ -62,12 +79,28 @@ fn enter_userns_map_root() -> Result<(), Errno> {
     Ok(())
 }
 
+// UTS namespace setup is only compiled when the 'uts' feature is enabled.
+#[cfg(feature = "uts")]
+fn maybe_enter_uts_ns_if_needed(hostname: &Option<String>) -> Result<(), Errno> {
+    if hostname.is_some() {
+        dbgln!("proclet(debug): unshare(CLONE_NEWUTS) for hostname");
+        unshare(CloneFlags::CLONE_NEWUTS)?;
+    }
+    Ok(())
+}
+
+// When the 'uts' feature is disabled, do nothing (main.rs already validates).
+#[cfg(not(feature = "uts"))]
+fn maybe_enter_uts_ns_if_needed(_hostname: &Option<String>) -> Result<(), Errno> {
+    Ok(())
+}
+
 /// Runtime options for Proclet.
 #[derive(Debug, Default, Clone)]
 pub struct ProcletOpts {
     /// Remount a fresh `/proc` inside the sandbox. Disable for debugging.
     pub mount_proc: bool,
-    /// Optional hostname to set inside the (shared) UTS context.
+    /// Optional hostname to set inside the (isolated) UTS context (requires feature `uts`).
     pub hostname: Option<String>,
     /// Optional working directory to `chdir` into before exec.
     pub chdir: Option<PathBuf>,
@@ -82,7 +115,7 @@ pub struct ProcletOpts {
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
-/// Order: USER → MNT → PID
+/// Order: USER → (UTS?) → MNT → PID
 pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno> {
     if argv.is_empty() {
         return Err(Errno::EINVAL);
@@ -93,9 +126,15 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         enter_userns_map_root()?;
     }
 
+    // 0.5) UTS namespace if hostname requested (only when built with `uts`)
+    maybe_enter_uts_ns_if_needed(&opts.hostname)?;
+
     // 1) Isolate mount namespace so our mounts don't leak out.
     if opts.use_mnt {
+        dbgln!("proclet(debug): unshare(CLONE_NEWNS)");
         unshare(CloneFlags::CLONE_NEWNS)?;
+
+        dbgln!("proclet(debug): remount / as MS_PRIVATE|MS_REC");
         mount::<str, str, str, str>(
             None,
             "/",
@@ -108,6 +147,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         for (host, inside, ro) in &opts.binds {
             // Ensure the target exists (best-effort for dirs)
             let _ = std::fs::create_dir_all(inside);
+            dbgln!("proclet(debug): bind {:?} -> {:?} (ro={})", host, inside, ro);
             mount(
                 Some(host.as_path()),
                 inside,
@@ -129,6 +169,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
         if opts.readonly_root {
             // Best-effort remount / read-only (may fail on some hosts)
+            dbgln!("proclet(debug): remount / read-only (best-effort)");
             let _ = mount::<str, str, str, str>(
                 None,
                 "/",
@@ -141,6 +182,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
     // 2) Create a new PID namespace (affects future children)
     if opts.use_pid {
+        dbgln!("proclet(debug): unshare(CLONE_NEWPID)");
         unshare(CloneFlags::CLONE_NEWPID)?;
     }
 
@@ -148,9 +190,12 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     match unsafe { fork()? } {
         ForkResult::Child => {
             // --- Child == PID 1 ---
+            #[cfg(feature = "uts")]
             if let Some(h) = &opts.hostname {
-                set_hostname(h)?; // works after userns mapping if CAP_SYS_ADMIN in-ns
+                dbgln!("proclet(debug): sethostname({})", h);
+                set_hostname(h)?; // requires UTS ns; userns grants caps in-ns
             }
+
             if opts.mount_proc && opts.use_mnt {
                 setup_proc()?;
             }
@@ -188,7 +233,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     }
                     unsafe {
                         let mut sa: libc::sigaction = std::mem::zeroed();
-                        // Use sa_handler to avoid union casting gymnastics
+                        // Use sa_handler via sa_sigaction cast (portable enough here)
                         sa.sa_sigaction = fwd_sig as usize;
                         sa.sa_flags = 0;
                         libc::sigemptyset(&mut sa.sa_mask);
@@ -253,6 +298,7 @@ fn setup_proc() -> Result<(), Errno> {
 }
 
 /// Set the hostname using libc (keeps `nix` features minimal).
+#[cfg(feature = "uts")]
 fn set_hostname(name: &str) -> Result<(), Errno> {
     let c = CString::new(name).map_err(|_| Errno::EINVAL)?;
     let rc = unsafe { libc::sethostname(c.as_ptr(), name.len()) };
@@ -262,6 +308,8 @@ fn set_hostname(name: &str) -> Result<(), Errno> {
         Err(Errno::last())
     }
 }
+
+// When 'uts' feature is off, don't even compile a setter (callers are cfg-guarded).
 
 /// Convert `&str` slices to `CString`s for `execvp`.
 pub fn cstrings(args: &[&str]) -> Vec<CString> {

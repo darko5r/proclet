@@ -24,16 +24,27 @@ pub enum Ns {
     Pid,
     /// New mount namespace (private mounts + fresh /proc)
     Mnt,
-    /// Placeholder for future net namespace
+
+    /// Placeholder for future net namespace (requires building with `--features net`)
     Net,
+
+    #[cfg(feature = "uts")]
+    /// New UTS namespace (hostname/domain isolation) — requires building with `--features uts`
+    Uts,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
 pub struct Cli {
-    /// Namespace(s) to enable
-    #[arg(long = "ns", value_enum, num_args=1.., value_delimiter=',',
-        default_values_t = [Ns::User, Ns::Pid, Ns::Mnt])]
+    /// Namespace(s) to enable (comma-separated). Note: `net` requires build feature `net`,
+    /// and `uts` is only available when built with `--features uts`.
+    #[arg(
+        long = "ns",
+        value_enum,
+        num_args = 1..,
+        value_delimiter = ',',
+        default_values_t = [Ns::User, Ns::Pid, Ns::Mnt]
+    )]
     pub ns: Vec<Ns>,
 
     /// Do NOT mount a fresh /proc (only valid if Mnt is enabled)
@@ -44,12 +55,15 @@ pub struct Cli {
     #[arg(long)]
     pub workdir: Option<String>,
 
-    /// Set hostname inside PID/MNT ns (cosmetic; requires MNT ns)
+    /// Set hostname inside the sandbox.
+    ///
+    /// Build note: requires compiling with `--features uts`. Without that feature,
+    /// proclet will exit with EX_USAGE if this flag is used.
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Bind-mounts: --bind /host:/inside[:ro] (repeatable)
-    #[arg(long, value_delimiter=',')]
+    /// Bind-mounts: --bind /host:/inside[:ro] (repeatable; comma-separated also supported)
+    #[arg(long, value_delimiter = ',')]
     pub bind: Vec<String>,
 
     /// Make root filesystem read-only (remount / as MS_RDONLY)
