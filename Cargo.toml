@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 authors = ["darko5r <darko83@pm.me>"]
 description = "Lightweight Linux sandbox tool written in pure Rust using PID and mount namespaces."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/darko5r/proclet"
 keywords = ["sandbox", "namespace", "linux", "isolation"]
@@ -15,9 +15,23 @@ nix = { version = "0.29", features = ["mount", "sched", "process", "signal", "fs
 libc = "0.2"
 clap = { version = "4.5.50", features = ["derive"] }
 
+[features]
+# Default build includes the core (user/pid/mnt).
+default = ["core"]
+
+# Core namespaces and behavior already implemented.
+core = []
+
+# Optional pieces you’ll gate in code with #[cfg(feature = "...")]
+net = []        # network namespace (CLONE_NEWNET)
+ipc = []        # IPC namespace (CLONE_NEWIPC)
+uts = []        # hostname isolation (CLONE_NEWUTS)
+cgroups = []    # cgroup v2 limits
+seccomp = []    # syscall filtering
+debug = []      # extra logging / diagnostics
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
-opt-level = "s"              # ← keep it as a string or change to a number (3)
-
+opt-level = "s"
