@@ -16,13 +16,12 @@ libc = "0.2"
 clap = { version = "4.5.50", features = ["derive"] }
 
 [features]
-# Default build includes the core (user/pid/mnt).
+# Default build
 default = ["core"]
 
-# Core namespaces and behavior already implemented.
 core = []
 
-# Optional pieces you’ll gate in code with #[cfg(feature = "...")]
+# Optional pieces, add later
 net = []        # network namespace (CLONE_NEWNET)
 ipc = []        # IPC namespace (CLONE_NEWIPC)
 uts = []        # hostname isolation (CLONE_NEWUTS)
@@ -31,7 +30,11 @@ seccomp = []    # syscall filtering
 debug = []      # extra logging / diagnostics
 
 [profile.release]
-lto = "fat"
+opt-level = 3
+lto = "fat" 
 codegen-units = 1
 strip = "symbols"
-opt-level = "s"
+panic = "abort"
+debug-assertions = false
+overflow-checks = false
+incremental = false
