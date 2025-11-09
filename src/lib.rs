@@ -15,8 +15,10 @@
  */
 
 //! Core sandbox engine
-
-// Optional safety net: fail if someone builds without `core`.
+/// _______________________________________________________________________________________________________________________
+/// Compile-time safeguard: this library requires the `core` feature to function.
+/// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
+/// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
 compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`.");
 
@@ -24,7 +26,11 @@ use nix::{
     errno::Errno,
     mount::{mount, umount2, MntFlags, MsFlags},
     sched::{unshare, CloneFlags},
-    sys::wait::{waitpid, WaitPidFlag, WaitStatus},
+    sys::{
+        signal::{SigSet, SigmaskHow, Signal},
+        signalfd::{SfdFlags, SignalFd},
+        wait::{waitpid, WaitPidFlag, WaitStatus},
+    },
     unistd::{chdir, execvp, fork, ForkResult},
 };
 use std::{
@@ -51,8 +57,14 @@ fn write_file(path: &str, s: &str) -> Result<(), Errno> {
     f.write_all(s.as_bytes()).map_err(to_errno)
 }
 
-/// Enter a user namespace and map real uid/gid → root (0) inside.
-/// If we're already real root outside, skip userns entirely (not needed for mounts).
+/// _________________________________________________________________________________
+/// Enter a new user namespace and map the real UID/GID to root (0) inside it.
+/// This gives the process root-like privileges *within* the sandbox, without
+/// needing real root permissions on the host.
+///
+/// Acts as a safety net: if we’re already real root outside, skip userns entirely,
+/// since there’s no need to remap anything for mounts or capabilities.
+/// _________________________________________________________________________________
 fn enter_userns_map_root() -> Result<(), Errno> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
@@ -113,6 +125,36 @@ pub struct ProcletOpts {
     pub binds: Vec<(PathBuf, PathBuf, bool)>, // (host, inside, ro?)
 }
 
+/// Exhaustively reap all available children. If `direct_pid` (the payload leader)
+/// has exited, returns its exit code (or 128+signal).
+fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
+    let mut direct_exit: Option<i32> = None;
+    loop {
+        match waitpid(
+            None,
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
+        ) {
+            Ok(WaitStatus::Exited(pid, code)) => {
+                if pid.as_raw() == direct_pid { direct_exit = Some(code); }
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                if pid.as_raw() == direct_pid { direct_exit = Some(128 + sig as i32); }
+            }
+            Ok(WaitStatus::Stopped(_, _))
+            | Ok(WaitStatus::Continued(_))
+            | Ok(WaitStatus::PtraceEvent(_, _, _))
+            | Ok(WaitStatus::PtraceSyscall(_)) => {
+                // ignore; not relevant for regular supervision
+            }
+            Ok(WaitStatus::StillAlive) => break,
+            Err(Errno::ECHILD) => break,     // nothing left to reap
+            Err(Errno::EINTR) => continue,   // interrupted, try again
+            Err(e) => return Err(e),         // propagate any other error
+        }
+    }
+    Ok(direct_exit)
+}
+
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
 /// Order: USER → (UTS?) → MNT → PID
@@ -147,7 +189,12 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         for (host, inside, ro) in &opts.binds {
             // Ensure the target exists (best-effort for dirs)
             let _ = std::fs::create_dir_all(inside);
-            dbgln!("proclet(debug): bind {:?} -> {:?} (ro={})", host, inside, ro);
+            dbgln!(
+                "proclet(debug): bind {:?} -> {:?} (ro={})",
+                host,
+                inside,
+                ro
+            );
             mount(
                 Some(host.as_path()),
                 inside,
@@ -215,59 +262,91 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     std::process::exit(127);
                 }
                 ForkResult::Parent { child } => {
-                    // Ignore ctrl-c/term in PID1; we will forward to child group instead.
+                    // === NEW: subreaper + signalfd + full forward + exhaustive reap ===
+
+                    // 1) Become a subreaper: orphans in our subtree get reparented to us.
                     unsafe {
-                        libc::signal(libc::SIGINT, libc::SIG_IGN);
-                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
                     }
 
-                    // Forward SIGINT/SIGTERM that PID1 receives to the child’s process group.
-                    extern "C" fn fwd_sig(sig: libc::c_int) {
-                        unsafe {
-                            let pg = libc::getpgrp();
-                            if pg > 0 {
-                                // Negative PGID targets the whole process group
-                                let _ = libc::kill(-pg, sig);
+                    // 2) Ensure the payload is its own process group; store its PGID
+                    unsafe {
+                        libc::setpgid(child.as_raw(), child.as_raw());
+                    }
+                    let payload_pgid: libc::pid_t = child.as_raw();
+
+                    // 3) Block signals we want to manage and route them via signalfd
+                    let mut mask = SigSet::empty();
+                    for s in [
+                        Signal::SIGINT,
+                        Signal::SIGTERM,
+                        Signal::SIGHUP,
+                        Signal::SIGQUIT,
+                        Signal::SIGUSR1,
+                        Signal::SIGUSR2,
+                        Signal::SIGTSTP,
+                        Signal::SIGCONT,
+                        Signal::SIGWINCH,
+                        Signal::SIGCHLD,
+                    ] {
+                        mask.add(s);
+                    }
+                    // Block so default handlers won't run; we will read from signalfd.
+                    nix::sys::signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
+
+                    // 4) signalfd to consume the blocked signals synchronously
+                    let sfd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC)?;
+
+                    // 5) Main supervision loop: read signals → forward or reap
+                    let mut exit_code: Option<i32> = None;
+
+                    loop {
+                        match sfd.read_signal() {
+                            Ok(Some(si)) => {
+                                let signo = si.ssi_signo as i32;
+                                let sig = Signal::try_from(signo).ok();
+
+                                if matches!(sig, Some(Signal::SIGCHLD)) {
+                                    // Reap everything available; capture direct child's exit if any.
+                                    if let Some(code) = reap_all(child.as_raw())? {
+                                        exit_code = Some(code);
+                                    }
+                                } else if let Some(sig) = sig {
+                                    // Forward almost everything else to the entire payload process group.
+                                    // Negative PGID means: deliver to the process group.
+                                    unsafe {
+                                        libc::kill(-payload_pgid, sig as i32);
+                                    }
+                                }
+
+                                // If our direct child is done: graceful shutdown of the group
+                                if let Some(code) = exit_code {
+                                    // Best-effort TERM then KILL after a short grace
+                                    unsafe { libc::kill(-payload_pgid, libc::SIGTERM) };
+                                    // ~200ms grace
+                                    let ts = libc::timespec {
+                                        tv_sec: 0,
+                                        tv_nsec: 200_000_000,
+                                    };
+                                    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                                    unsafe { libc::kill(-payload_pgid, libc::SIGKILL) };
+
+                                    // Drain any stragglers before exiting
+                                    let _ = reap_all(child.as_raw());
+                                    return Ok(code);
+                                }
+                            }
+                            Ok(None) => continue, // nothing to read (shouldn't happen with blocking fd)
+                            Err(e) if e == Errno::EINTR => continue,
+                            Err(e) => {
+                                eprintln!("proclet: signalfd error: {e}");
+                                // Fallback: try reaping; if direct child is gone, exit with its code
+                                if let Some(code) = reap_all(child.as_raw())? {
+                                    return Ok(code);
+                                }
                             }
                         }
                     }
-                    unsafe {
-                        let mut sa: libc::sigaction = std::mem::zeroed();
-                        // Use sa_handler via sa_sigaction cast (portable enough here)
-                        sa.sa_sigaction = fwd_sig as usize;
-                        sa.sa_flags = 0;
-                        libc::sigemptyset(&mut sa.sa_mask);
-                        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-                        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-                    }
-
-                    // Reap until direct child exits; propagate exit code.
-                    let exit_code = loop {
-                        match waitpid(
-                            None,
-                            Some(WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-                        )? {
-                            WaitStatus::Exited(pid, code) if pid == child => break code,
-                            WaitStatus::Signaled(pid, sig, _) if pid == child => {
-                                break 128 + sig as i32
-                            }
-                            // Reap strays/zombies; continue waiting for our direct child.
-                            WaitStatus::Exited(_, _)
-                            | WaitStatus::Signaled(_, _, _)
-                            | WaitStatus::StillAlive => {}
-                            _ => {}
-                        }
-                    };
-
-                    // Best-effort termination for leftovers in our group.
-                    unsafe {
-                        let pg = libc::getpgrp();
-                        if pg > 0 {
-                            let _ = libc::kill(-pg, libc::SIGTERM);
-                        }
-                    }
-
-                    Ok(exit_code)
                 }
             }
         }
