@@ -35,11 +35,10 @@ use nix::{
 };
 use std::{
     ffi::CString,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
 };
-
-use std::fs::OpenOptions;
-use std::io::Write;
 
 // ---- debug helper (enabled only with `--features debug`) ----
 #[cfg(feature = "debug")]
@@ -51,8 +50,12 @@ macro_rules! dbgln {
     ($($t:tt)*) => {};
 }
 
+#[inline]
+fn to_errno(e: std::io::Error) -> Errno {
+    Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
 fn write_file(path: &str, s: &str) -> Result<(), Errno> {
-    let to_errno = |e: std::io::Error| Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO));
     let mut f = OpenOptions::new().write(true).open(path).map_err(to_errno)?;
     f.write_all(s.as_bytes()).map_err(to_errno)
 }
@@ -135,10 +138,14 @@ fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
             Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
         ) {
             Ok(WaitStatus::Exited(pid, code)) => {
-                if pid.as_raw() == direct_pid { direct_exit = Some(code); }
+                if pid.as_raw() == direct_pid {
+                    direct_exit = Some(code);
+                }
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                if pid.as_raw() == direct_pid { direct_exit = Some(128 + sig as i32); }
+                if pid.as_raw() == direct_pid {
+                    direct_exit = Some(128 + sig as i32);
+                }
             }
             Ok(WaitStatus::Stopped(_, _))
             | Ok(WaitStatus::Continued(_))
@@ -147,9 +154,9 @@ fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
                 // ignore; not relevant for regular supervision
             }
             Ok(WaitStatus::StillAlive) => break,
-            Err(Errno::ECHILD) => break,     // nothing left to reap
-            Err(Errno::EINTR) => continue,   // interrupted, try again
-            Err(e) => return Err(e),         // propagate any other error
+            Err(Errno::ECHILD) => break,   // nothing left to reap
+            Err(Errno::EINTR) => continue, // interrupted, try again
+            Err(e) => return Err(e),       // propagate any other error
         }
     }
     Ok(direct_exit)
@@ -262,7 +269,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     std::process::exit(127);
                 }
                 ForkResult::Parent { child } => {
-                    // === NEW: subreaper + signalfd + full forward + exhaustive reap ===
+                    // === subreaper + signalfd + full forward + exhaustive reap ===
 
                     // 1) Become a subreaper: orphans in our subtree get reparented to us.
                     unsafe {
@@ -336,7 +343,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                     return Ok(code);
                                 }
                             }
-                            Ok(None) => continue, // nothing to read (shouldn't happen with blocking fd)
+                            Ok(None) => continue, // nothing to read (blocking fd, so unlikely)
                             Err(e) if e == Errno::EINTR => continue,
                             Err(e) => {
                                 eprintln!("proclet: signalfd error: {e}");
@@ -387,8 +394,6 @@ fn set_hostname(name: &str) -> Result<(), Errno> {
         Err(Errno::last())
     }
 }
-
-// When 'uts' feature is off, don't even compile a setter (callers are cfg-guarded).
 
 /// Convert `&str` slices to `CString`s for `execvp`.
 pub fn cstrings(args: &[&str]) -> Vec<CString> {

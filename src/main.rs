@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
+#![allow(clippy::needless_return)]
 #[cfg(not(feature = "core"))]
-compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`.");
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
 
 mod cli;
 
@@ -34,6 +35,12 @@ const FEATURE_NET: bool = false;
 const FEATURE_UTS: bool = true;
 #[cfg(not(feature = "uts"))]
 const FEATURE_UTS: bool = false;
+
+// Only define FEATURE_REACTOR in debug builds (it’s only printed in dbg output)
+#[cfg(all(feature = "debug", feature = "reactor"))]
+const FEATURE_REACTOR: bool = true;
+#[cfg(all(feature = "debug", not(feature = "reactor")))]
+const FEATURE_REACTOR: bool = false;
 
 #[cfg(feature = "debug")]
 macro_rules! dbgln {
@@ -64,24 +71,28 @@ fn main() {
 
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
-        eprintln!("proclet: this binary was built without the `net` feature.\n\
-                   Rebuild with: cargo build --features net\n\
-                   (requested: --ns net)");
+        eprintln!(
+            "proclet: this binary was built without the `net` feature.\n\
+             Rebuild with: cargo build --features net\n\
+             (requested: --ns net)"
+        );
         std::process::exit(64); // EX_USAGE
     }
 
     if cli.hostname.is_some() && !FEATURE_UTS {
-        eprintln!("proclet: setting hostname requires the `uts` feature.\n\
-                   Rebuild with: cargo build --features uts\n\
-                   (requested: --hostname ...)");
+        eprintln!(
+            "proclet: setting hostname requires the `uts` feature.\n\
+             Rebuild with: cargo build --features uts\n\
+             (requested: --hostname ...)"
+        );
         std::process::exit(64); // EX_USAGE
     }
 
     let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
     let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
@@ -91,7 +102,7 @@ fn main() {
 
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -100,7 +111,18 @@ fn main() {
         cli.no_proc,
         cli.workdir,
         cli.hostname,
-        cli.bind
+        cli.bind,
+        // append reactor flag only when it's defined (i.e., in debug builds)
+        {
+            #[cfg(feature = "debug")]
+            {
+                format!(", reactor={}", FEATURE_REACTOR)
+            }
+            #[cfg(not(feature = "debug"))]
+            {
+                String::new()
+            }
+        }
     );
 
     let opts = ProcletOpts {
