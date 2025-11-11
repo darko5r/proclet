@@ -1,8 +1,10 @@
 ## To-do list for 11/05/2025-11/15/2025
 
-Add subreaper + signalfd + full signal forward + exhaustive reap.
+done ✓ Add subreaper + signalfd + full signal forward + exhaustive reap.
 
-Implement UTS ns when --hostname is used.
+done ✓ Implement UTS ns when --hostname is used.
+
+to do:
 
 Mount helpers: /tmp tmpfs, minimal /dev, pivot_root path for --readonly.
 
