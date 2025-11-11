@@ -3,21 +3,43 @@
 # =========================
 /target/
 debug/
-**/*.rs.bk           # rustfmt backups
+release/
+*.rs.bk                 # rustfmt backups
+Cargo.lock              # optional
+**/*.profraw            # LLVM coverage data (for cargo tarpaulin, etc...)
+**/*.profdata
+**/*.gcda
+**/*.gcno
 
 # =========================
-# Logs / temp
+# Logs / Temporary files
 # =========================
 *.log
 *.tmp
 *.swp
 *.swo
 *~
+*.bak
+*.old
 
 # =========================
-# OS / Editors
+# OS / Editors / IDEs
 # =========================
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
 *.iml
+*.sublime-project
+*.sublime-workspace
+
+# =========================
+# Tests / Tools / Misc
+# =========================
+*.out
+*.pid
+*.seed
+*.dSYM/
+coverage/
+.env
+.env.*
