@@ -20,7 +20,7 @@
 /// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
 /// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
-compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`.");
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
 
 use nix::{
     errno::Errno,
@@ -94,7 +94,7 @@ fn enter_userns_map_root() -> Result<(), Errno> {
     Ok(())
 }
 
-// UTS namespace setup is only compiled when the 'uts' feature is enabled.
+// ---- UTS helpers (only compiled when `--features uts`) ----
 #[cfg(feature = "uts")]
 fn maybe_enter_uts_ns_if_needed(hostname: &Option<String>) -> Result<(), Errno> {
     if hostname.is_some() {
@@ -104,9 +104,25 @@ fn maybe_enter_uts_ns_if_needed(hostname: &Option<String>) -> Result<(), Errno> 
     Ok(())
 }
 
-// When the 'uts' feature is disabled, do nothing (main.rs already validates).
 #[cfg(not(feature = "uts"))]
 fn maybe_enter_uts_ns_if_needed(_hostname: &Option<String>) -> Result<(), Errno> {
+    Ok(())
+}
+
+/// Preflight: if `--hostname` is requested, ensure we have a way to call sethostname().
+/// Rule of thumb:
+/// - with `--ns user` (userns), non-root callers gain in-ns CAP_SYS_ADMIN/CAP_SYS_NICE/CAP_SYS_CHROOT etc. and can set hostname;
+/// - without userns, you must be real root on the host.
+///
+/// We fail early with EPERM to give a clear error instead of a late syscall failure.
+#[cfg(feature = "uts")]
+fn ensure_hostname_possible(use_user: bool) -> Result<(), Errno> {
+    if !use_user {
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return Err(Errno::EPERM);
+        }
+    }
     Ok(())
 }
 
@@ -176,6 +192,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 
     // 0.5) UTS namespace if hostname requested (only when built with `uts`)
+    #[cfg(feature = "uts")]
+    if opts.hostname.is_some() {
+        ensure_hostname_possible(opts.use_user)?;
+    }
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
 
     // 1) Isolate mount namespace so our mounts don't leak out.
