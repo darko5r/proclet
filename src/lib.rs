@@ -27,16 +27,17 @@ use nix::{
     mount::{mount, umount2, MntFlags, MsFlags},
     sched::{unshare, CloneFlags},
     sys::{
-        signal::{SigSet, SigmaskHow, Signal},
+        signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal},
         signalfd::{SfdFlags, SignalFd},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
     unistd::{chdir, execvp, fork, ForkResult},
 };
 use std::{
-    ffi::CString,
+    ffi::{CString},
     fs::OpenOptions,
     io::Write,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
@@ -109,12 +110,10 @@ fn maybe_enter_uts_ns_if_needed(_hostname: &Option<String>) -> Result<(), Errno>
     Ok(())
 }
 
-/// Preflight: if `--hostname` is requested, ensure we have a way to call sethostname().
+/// Preflight: if `--hostname` is requested, ensure we can call sethostname().
 /// Rule of thumb:
-/// - with `--ns user` (userns), non-root callers gain in-ns CAP_SYS_ADMIN/CAP_SYS_NICE/CAP_SYS_CHROOT etc. and can set hostname;
+/// - with `--ns user`, non-root callers gain in-ns caps and can set hostname;
 /// - without userns, you must be real root on the host.
-///
-/// We fail early with EPERM to give a clear error instead of a late syscall failure.
 #[cfg(feature = "uts")]
 fn ensure_hostname_possible(use_user: bool) -> Result<(), Errno> {
     if !use_user {
@@ -176,6 +175,63 @@ fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
         }
     }
     Ok(direct_exit)
+}
+
+// === TTY foreground control helpers (fix interactive shells) ======================
+
+struct TtyGuard {
+    fd: i32,
+    had_tty: bool,
+    prev_fg: Option<libc::pid_t>,
+}
+
+impl TtyGuard {
+    fn take_for(payload_pgid: libc::pid_t) -> Self {
+        let fd = std::io::stdin().as_raw_fd();
+        let mut guard = TtyGuard { fd, had_tty: false, prev_fg: None };
+
+        // Only attempt if stdin is a TTY
+        if unsafe { libc::isatty(fd) } != 1 {
+            return guard;
+        }
+
+        // Temporarily ignore TTY stop signals so tcsetpgrp won't stop us
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        unsafe {
+            let _ = nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore);
+            let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore);
+        }
+
+        // Save previous foreground pgid (libc versions; no nix term feature needed)
+        let pg = unsafe { libc::tcgetpgrp(fd) };
+        if pg > 0 {
+            guard.prev_fg = Some(pg);
+        }
+
+        // Hand TTY to the payload's process group
+        if unsafe { libc::tcsetpgrp(fd, payload_pgid) } == 0 {
+            guard.had_tty = true;
+            dbgln!("proclet(debug): tty foreground -> pgid {}", payload_pgid);
+        }
+
+        // Restore default handlers
+        let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        unsafe {
+            let _ = nix::sys::signal::sigaction(Signal::SIGTTOU, &dfl);
+            let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &dfl);
+        }
+
+        guard
+    }
+
+    fn restore(&self) {
+        if self.had_tty {
+            if let Some(pg) = self.prev_fg {
+                let _ = unsafe { libc::tcsetpgrp(self.fd, pg) };
+                dbgln!("proclet(debug): tty foreground restored -> pgid {}", pg);
+            }
+        }
+    }
 }
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
@@ -302,6 +358,9 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     }
                     let payload_pgid: libc::pid_t = child.as_raw();
 
+                    // 2.5) Hand the controlling TTY to the payload's process group
+                    let tty_guard = TtyGuard::take_for(payload_pgid);
+
                     // 3) Block signals we want to manage and route them via signalfd
                     let mut mask = SigSet::empty();
                     for s in [
@@ -360,6 +419,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
                                     // Drain any stragglers before exiting
                                     let _ = reap_all(child.as_raw());
+
+                                    // Restore TTY before exit
+                                    tty_guard.restore();
+
                                     return Ok(code);
                                 }
                             }
@@ -369,6 +432,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                 eprintln!("proclet: signalfd error: {e}");
                                 // Fallback: try reaping; if direct child is gone, exit with its code
                                 if let Some(code) = reap_all(child.as_raw())? {
+                                    tty_guard.restore();
                                     return Ok(code);
                                 }
                             }
