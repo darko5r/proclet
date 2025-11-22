@@ -20,7 +20,10 @@
 /// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
 /// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
-compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
+compile_error!(
+    "proclet currently requires the `core` feature. \
+     Build with default features or enable `--features core`."
+);
 
 use nix::{
     errno::Errno,
@@ -34,7 +37,7 @@ use nix::{
     unistd::{chdir, execvp, fork, ForkResult},
 };
 use std::{
-    ffi::{CString},
+    ffi::CString,
     fs::OpenOptions,
     io::Write,
     os::fd::AsRawFd,
@@ -202,7 +205,7 @@ impl TtyGuard {
             let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore);
         }
 
-        // Save previous foreground pgid (libc versions; no nix term feature needed)
+        // Save previous foreground pgid
         let pg = unsafe { libc::tcgetpgrp(fd) };
         if pg > 0 {
             guard.prev_fg = Some(pg);
@@ -339,6 +342,18 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
                 ForkResult::Child => {
+                    // --- Inner child: actual payload ---------------------------------
+
+                    // Debug: show final argv we’re about to exec
+                    #[cfg(feature = "debug")]
+                    {
+                        let pretty: Vec<String> = argv
+                            .iter()
+                            .map(|c| c.to_string_lossy().into_owned())
+                            .collect();
+                        dbgln!("proclet(debug): execvp argv={:?}", pretty);
+                    }
+
                     // Exec the target (on success, never returns)
                     let e = execvp(&argv[0], argv).unwrap_err();
                     eprintln!("proclet: exec failed: {e}");

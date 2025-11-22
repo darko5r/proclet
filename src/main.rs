@@ -56,7 +56,6 @@ macro_rules! dbgln {
 }
 
 // ---------- helpers ----------
-
 fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
     // Syntax: /host:/inside[:ro]
     b.iter()
@@ -71,25 +70,29 @@ fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, boo
         .collect()
 }
 
-/// Helper for the convenience flags --bind-ro / --bind-rw.
-/// Strict syntax: /host:/inside (ro/rw decided by the flag itself).
-fn parse_binds_kind(
-    b: &[String],
-    ro_flag: bool,
-) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
-    b.iter()
-        .filter_map(|spec| {
-            let parts = spec.split(':').collect::<Vec<_>>();
-            if parts.len() != 2 {
-                return None;
-            }
-            Some((parts[0].into(), parts[1].into(), ro_flag))
-        })
-        .collect()
-}
-
 fn main() {
     let cli = Cli::parse();
+
+    // --- Guard against accidentally passing an extra `--` as the *command* ---
+    // Example of wrong usage that this catches:
+    //   proclet --ns user,pid,mnt -- -- id
+    // Correct form:
+    //   proclet --ns user,pid,mnt -- id
+    if let Some(first) = cli.cmd.first() {
+        if first == "--" {
+            eprintln!(
+                "proclet: first command argument is `--`.\n\
+                 You probably passed an extra `--` after the sandbox flags.\n\
+                 Correct usage:\n\
+                 \n\
+                 \tproclet [sandbox-flags…] -- CMD [ARG…]\n\
+                 \n\
+                 Example:\n\
+                 \tproclet --ns user,pid,mnt -- /bin/bash -i"
+            );
+            std::process::exit(64); // EX_USAGE
+        }
+    }
 
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
@@ -110,8 +113,7 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
-    let cargs: Vec<CString> =
-        cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
     let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
@@ -123,18 +125,10 @@ fn main() {
         std::process::exit(64);
     }
 
-    // Merge all bind sources:
-    //   --bind     /host:/inside[:ro]
-    //   --bind-ro  /host:/inside   (forced ro)
-    //   --bind-rw  /host:/inside   (forced rw)
-    let mut binds = parse_binds(&cli.bind);
-    binds.extend(parse_binds_kind(&cli.bind_ro, true));
-    binds.extend(parse_binds_kind(&cli.bind_rw, false));
-
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, \
-         readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, \
+         no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -143,9 +137,8 @@ fn main() {
         cli.no_proc,
         cli.workdir,
         cli.hostname,
-        binds,
+        cli.bind,
         {
-            // Append reactor flag only in debug builds (where FEATURE_REACTOR exists)
             #[cfg(feature = "debug")]
             {
                 format!(", reactor={}", FEATURE_REACTOR)
@@ -167,7 +160,7 @@ fn main() {
         use_pid,
         use_mnt,
         readonly_root: cli.readonly,
-        binds,
+        binds: parse_binds(&cli.bind),
     };
 
     match run_pid_mount(&cargs, &opts) {
@@ -178,3 +171,4 @@ fn main() {
         }
     }
 }
+
