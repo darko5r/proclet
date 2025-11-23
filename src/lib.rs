@@ -20,10 +20,7 @@
 /// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
 /// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
-compile_error!(
-    "proclet currently requires the `core` feature. \
-     Build with default features or enable `--features core`."
-);
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
 
 use nix::{
     errno::Errno,
@@ -41,6 +38,7 @@ use std::{
     fs::OpenOptions,
     io::Write,
     os::fd::AsRawFd,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -138,10 +136,8 @@ pub struct ProcletOpts {
     /// Optional working directory to `chdir` into before exec.
     pub chdir: Option<PathBuf>,
 
-    /// Optional new root (like a light chroot). If set, proclet will:
-    ///   - bind-mount this path on itself,
-    ///   - move-mount it to `/`,
-    ///   - and chdir("/") inside the private mount namespace.
+    /// Optional new root directory on the host to treat as `/` inside the sandbox.
+    /// This roughly corresponds to: bwrap --ro-bind /root / --chdir / (without auto-populating).
     pub new_root: Option<PathBuf>,
 
     // Namespace/FS toggles populated by main.rs
@@ -197,7 +193,11 @@ struct TtyGuard {
 impl TtyGuard {
     fn take_for(payload_pgid: libc::pid_t) -> Self {
         let fd = std::io::stdin().as_raw_fd();
-        let mut guard = TtyGuard { fd, had_tty: false, prev_fg: None };
+        let mut guard = TtyGuard {
+            fd,
+            had_tty: false,
+            prev_fg: None,
+        };
 
         // Only attempt if stdin is a TTY
         if unsafe { libc::isatty(fd) } != 1 {
@@ -211,7 +211,7 @@ impl TtyGuard {
             let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore);
         }
 
-        // Save previous foreground pgid
+        // Save previous foreground pgid (libc versions; no nix term feature needed)
         let pg = unsafe { libc::tcgetpgrp(fd) };
         if pg > 0 {
             guard.prev_fg = Some(pg);
@@ -245,7 +245,7 @@ impl TtyGuard {
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
-/// Order: USER → (UTS?) → MNT (+optional new_root) → PID
+/// Order: USER → (UTS?) → MNT → NEW_ROOT? → PID
 pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno> {
     if argv.is_empty() {
         return Err(Errno::EINVAL);
@@ -263,6 +263,9 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
 
+    // We'll need this locally to tweak mount behavior for --new-root.
+    let new_root_host: Option<PathBuf> = opts.new_root.clone();
+
     // 1) Isolate mount namespace so our mounts don't leak out.
     if opts.use_mnt {
         dbgln!("proclet(debug): unshare(CLONE_NEWNS)");
@@ -277,53 +280,37 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             None,
         )?;
 
-        // Optional: switch to a new filesystem root
-        if let Some(ref root) = opts.new_root {
-            dbgln!("proclet(debug): switching new root to {:?}", root);
-
-            // Best-effort ensure the directory exists
+        // If there is a new_root, ensure it exists on the host.
+        if let Some(root) = &new_root_host {
             let _ = std::fs::create_dir_all(root);
-
-            // Make it a mount point (bind-mount on itself)
-            mount(
-                Some(root.as_path()),
-                root.as_path(),
-                None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_REC,
-                None::<&str>,
-            )?;
-
-            // Move that mount tree to /
-            chdir(root)?;
-            mount(
-                Some(Path::new(".")),
-                Path::new("/"),
-                None::<&str>,
-                MsFlags::MS_MOVE,
-                None::<&str>,
-            )?;
-            chdir(Path::new("/"))?;
-
-            dbgln!("proclet(debug): new root is now /");
+            dbgln!("proclet(debug): new-root host dir prepared at {:?}", root);
         }
 
-        // Apply bind mounts before readonly root.
-        //
-        // NOTE: when new_root is set, both host and inside paths are interpreted
-        // inside that tree; for now we keep it simple: the caller is expected to
-        // prepare the root filesystem layout in advance.
+        // Apply bind mounts before readonly root and before chroot.
         for (host, inside, ro) in &opts.binds {
-            // Ensure the target exists (best-effort for dirs)
-            let _ = std::fs::create_dir_all(inside);
+            // For --new-root: map inside path under the future root.
+            let target_inside: PathBuf = if let Some(root) = &new_root_host {
+                if inside.is_absolute() {
+                    // /foo -> root/foo
+                    root.join(inside.strip_prefix("/").unwrap_or(inside))
+                } else {
+                    root.join(inside)
+                }
+            } else {
+                inside.clone()
+            };
+
+            let _ = std::fs::create_dir_all(&target_inside);
+
             dbgln!(
                 "proclet(debug): bind {:?} -> {:?} (ro={})",
                 host,
-                inside,
+                target_inside,
                 ro
             );
             mount(
                 Some(host.as_path()),
-                inside,
+                &target_inside,
                 None::<&str>,
                 MsFlags::MS_BIND | MsFlags::MS_REC,
                 None::<&str>,
@@ -332,7 +319,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 // Remount bind as read-only
                 mount::<str, Path, str, str>(
                     None,
-                    inside,
+                    &target_inside,
                     None,
                     MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
                     None,
@@ -340,16 +327,42 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             }
         }
 
+        // Remount root read-only. If new-root is set, apply it to that path.
         if opts.readonly_root {
-            // Best-effort remount / read-only (may fail on some hosts)
-            dbgln!("proclet(debug): remount / read-only (best-effort)");
-            let _ = mount::<str, str, str, str>(
-                None,
-                "/",
-                None,
-                MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
-                None,
-            );
+            if let Some(root) = &new_root_host {
+                dbgln!(
+                    "proclet(debug): remount new-root {:?} read-only (best-effort)",
+                    root
+                );
+                let _ = mount::<str, Path, str, str>(
+                    None,
+                    root,
+                    None,
+                    MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                    None,
+                );
+            } else {
+                dbgln!("proclet(debug): remount / read-only (best-effort)");
+                let _ = mount::<str, str, str, str>(
+                    None,
+                    "/",
+                    None,
+                    MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                    None,
+                );
+            }
+        }
+
+        // 1.5) If new_root is set, make it the process root via chroot().
+        if let Some(root) = &new_root_host {
+            dbgln!("proclet(debug): chroot({:?})", root);
+            let c = CString::new(root.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+            let rc = unsafe { libc::chroot(c.as_ptr()) };
+            if rc != 0 {
+                return Err(Errno::last());
+            }
+            // Ensure cwd is inside the new root.
+            chdir(Path::new("/"))?;
         }
     }
 
@@ -382,19 +395,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
                 ForkResult::Child => {
-                    // --- Inner child: actual payload ---------------------------------
-
-                    // Debug: show final argv we’re about to exec
+                    // Exec the target (on success, never returns)
                     #[cfg(feature = "debug")]
                     {
-                        let pretty: Vec<String> = argv
-                            .iter()
-                            .map(|c| c.to_string_lossy().into_owned())
-                            .collect();
-                        dbgln!("proclet(debug): execvp argv={:?}", pretty);
+                        dbgln!("proclet(debug): execvp argv = {:?}", argv);
                     }
-
-                    // Exec the target (on success, never returns)
                     let e = execvp(&argv[0], argv).unwrap_err();
                     eprintln!("proclet: exec failed: {e}");
                     std::process::exit(127);
@@ -507,7 +512,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 }
 
-/// Mount a fresh `/proc` inside the current mount namespace.
+/// Mount a fresh `/proc` inside the current (possibly chrooted) mount namespace.
 fn setup_proc() -> Result<(), Errno> {
     let proc_path = Path::new("/proc");
     let _ = umount2(proc_path, MntFlags::MNT_DETACH);
