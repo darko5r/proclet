@@ -17,11 +17,27 @@
 use clap::{Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum Ns { User, Pid, Mnt, Net, #[cfg(feature = "uts")] Uts }
+pub enum Ns {
+    /// New USER namespace (map real uid/gid -> root inside)
+    User,
+    /// New PID namespace (child becomes PID 1)
+    Pid,
+    /// New mount namespace (private mounts + fresh /proc)
+    Mnt,
+
+    /// Placeholder for future net namespace (requires building with `--features net`)
+    Net,
+
+    #[cfg(feature = "uts")]
+    /// New UTS namespace (hostname/domain isolation) — requires building with `--features uts`
+    Uts,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
 pub struct Cli {
+    /// Namespace(s) to enable (comma-separated). Note: `net` requires build feature `net`,
+    /// and `uts` is only available when built with `--features uts`.
     #[arg(
         long = "ns",
         value_enum,
@@ -31,27 +47,38 @@ pub struct Cli {
     )]
     pub ns: Vec<Ns>,
 
+    /// Do NOT mount a fresh /proc (only valid if Mnt is enabled)
     #[arg(long)]
     pub no_proc: bool,
 
+    /// Use PATH as the new filesystem root (like a lightweight chroot).
+    ///
+    /// Internally, proclet will:
+    ///   - unshare the mount namespace,
+    ///   - bind-mount PATH on itself,
+    ///   - move that mount tree to `/`,
+    ///   - and chdir("/") inside the sandbox.
+    ///
+    /// Requires that `mnt` is included in `--ns`.
+    #[arg(long = "new-root")]
+    pub new_root: Option<String>,
+
+    /// Set working directory inside the sandbox (after namespaces)
     #[arg(long)]
     pub workdir: Option<String>,
 
+    /// Set hostname inside the sandbox.
+    ///
+    /// Build note: requires compiling with `--features uts`. Without that feature,
+    /// proclet will exit with EX_USAGE if this flag is used.
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Generic binds: /host:/inside[:ro]
+    /// Bind-mounts: --bind /host:/inside[:ro] (repeatable; comma-separated also supported)
     #[arg(long, value_delimiter = ',')]
     pub bind: Vec<String>,
 
-    /// Convenience: read-only binds (format: /host:/inside)
-    #[arg(long = "bind-ro", value_delimiter = ',')]
-    pub bind_ro: Vec<String>,
-
-    /// Convenience: read-write binds (format: /host:/inside)
-    #[arg(long = "bind-rw", value_delimiter = ',')]
-    pub bind_rw: Vec<String>,
-
+    /// Make root filesystem read-only (remount / as MS_RDONLY)
     #[arg(long)]
     pub readonly: bool,
 

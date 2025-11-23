@@ -138,6 +138,12 @@ pub struct ProcletOpts {
     /// Optional working directory to `chdir` into before exec.
     pub chdir: Option<PathBuf>,
 
+    /// Optional new root (like a light chroot). If set, proclet will:
+    ///   - bind-mount this path on itself,
+    ///   - move-mount it to `/`,
+    ///   - and chdir("/") inside the private mount namespace.
+    pub new_root: Option<PathBuf>,
+
     // Namespace/FS toggles populated by main.rs
     pub use_user: bool,
     pub use_pid: bool,
@@ -239,7 +245,7 @@ impl TtyGuard {
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
-/// Order: USER → (UTS?) → MNT → PID
+/// Order: USER → (UTS?) → MNT (+optional new_root) → PID
 pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno> {
     if argv.is_empty() {
         return Err(Errno::EINVAL);
@@ -271,7 +277,41 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             None,
         )?;
 
-        // Apply bind mounts before readonly root
+        // Optional: switch to a new filesystem root
+        if let Some(ref root) = opts.new_root {
+            dbgln!("proclet(debug): switching new root to {:?}", root);
+
+            // Best-effort ensure the directory exists
+            let _ = std::fs::create_dir_all(root);
+
+            // Make it a mount point (bind-mount on itself)
+            mount(
+                Some(root.as_path()),
+                root.as_path(),
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )?;
+
+            // Move that mount tree to /
+            chdir(root)?;
+            mount(
+                Some(Path::new(".")),
+                Path::new("/"),
+                None::<&str>,
+                MsFlags::MS_MOVE,
+                None::<&str>,
+            )?;
+            chdir(Path::new("/"))?;
+
+            dbgln!("proclet(debug): new root is now /");
+        }
+
+        // Apply bind mounts before readonly root.
+        //
+        // NOTE: when new_root is set, both host and inside paths are interpreted
+        // inside that tree; for now we keep it simple: the caller is expected to
+        // prepare the root filesystem layout in advance.
         for (host, inside, ro) in &opts.binds {
             // Ensure the target exists (best-effort for dirs)
             let _ = std::fs::create_dir_all(inside);

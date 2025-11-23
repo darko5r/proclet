@@ -94,8 +94,13 @@ fn main() {
         }
     }
 
+    let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
+    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+
     // --- Validate feature-dependent flags up front ---
-    if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
+    if _use_net && !FEATURE_NET {
         eprintln!(
             "proclet: this binary was built without the `net` feature.\n\
              Rebuild with: cargo build --features net\n\
@@ -113,28 +118,32 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
-    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-
-    let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+    if cli.new_root.is_some() && !use_mnt {
+        eprintln!(
+            "proclet: --new-root requires the mount namespace.\n\
+             Include `mnt` in --ns, e.g.: --ns user,pid,mnt"
+        );
+        std::process::exit(64);
+    }
 
     if !use_pid || !use_mnt {
         eprintln!("proclet: currently requires ns=pid,mnt (others coming soon)");
         std::process::exit(64);
     }
 
+    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
     // Optional debug dump (only if built with --features debug)
     dbgln!(
         "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, \
-         no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
+         no_proc={}, new_root={:?}, workdir={:?}, hostname={:?}, binds={:?}{}",
         use_user,
         use_pid,
         use_mnt,
         _use_net,
         cli.readonly,
         cli.no_proc,
+        cli.new_root,
         cli.workdir,
         cli.hostname,
         cli.bind,
@@ -155,6 +164,8 @@ fn main() {
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
 
+        new_root: cli.new_root.as_deref().map(Into::into),
+
         // existing toggles
         use_user,
         use_pid,
@@ -171,4 +182,3 @@ fn main() {
         }
     }
 }
-
