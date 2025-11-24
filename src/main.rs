@@ -15,11 +15,9 @@
  */
 
 #![allow(clippy::needless_return)]
-
 #[cfg(not(feature = "core"))]
 compile_error!(
-    "proclet currently requires the `core` feature. \
-     Build with default features or enable `--features core`."
+    "proclet currently requires the `core` feature. Build with default features or enable `--features core`."
 );
 
 mod cli;
@@ -73,34 +71,8 @@ fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, boo
 fn main() {
     let cli = Cli::parse();
 
-    // --- Guard against accidentally passing an extra `--` as the *command* ---
-    // Example of wrong usage that this catches:
-    //   proclet --ns user,pid,mnt -- -- id
-    // Correct form:
-    //   proclet --ns user,pid,mnt -- id
-    if let Some(first) = cli.cmd.first() {
-        if first == "--" {
-            eprintln!(
-                "proclet: first command argument is `--`.\n\
-                 You probably passed an extra `--` after the sandbox flags.\n\
-                 Correct usage:\n\
-                 \n\
-                 \tproclet [sandbox-flags…] -- CMD [ARG…]\n\
-                 \n\
-                 Example:\n\
-                 \tproclet --ns user,pid,mnt -- /bin/bash -i"
-            );
-            std::process::exit(64); // EX_USAGE
-        }
-    }
-
-    let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
-
     // --- Validate feature-dependent flags up front ---
-    if _use_net && !FEATURE_NET {
+    if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
         eprintln!(
             "proclet: this binary was built without the `net` feature.\n\
              Rebuild with: cargo build --features net\n\
@@ -118,35 +90,52 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
-    if cli.new_root.is_some() && !use_mnt {
-        eprintln!(
-            "proclet: --new-root requires the mount namespace.\n\
-             Include `mnt` in --ns, e.g.: --ns user,pid,mnt"
-        );
-        std::process::exit(64);
+    // --- Sanity check: avoid the old `-- -- cmd` pattern ---
+    if let Some(first) = cli.cmd.first() {
+        if first == "--" {
+            eprintln!(
+                "proclet: invalid command vector (starts with `--`).\n\
+                 Hint: do NOT pass an extra `--` *inside* the command.\n\
+                 Example:\n\
+                 \n\
+                 \t# bad\n\
+                 \tproclet --ns user,pid,mnt -- -- id\n\
+                 \n\
+                 \t# good\n\
+                 \tproclet --ns user,pid,mnt -- id\n"
+            );
+            std::process::exit(64); // EX_USAGE
+        }
     }
+
+    let cargs: Vec<CString> =
+        cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+
+    let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
+    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
         eprintln!("proclet: currently requires ns=pid,mnt (others coming soon)");
         std::process::exit(64);
     }
 
-    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
-
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, \
-         no_proc={}, new_root={:?}, workdir={:?}, hostname={:?}, binds={:?}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, \
+         workdir={:?}, hostname={:?}, new_root={:?}, binds={:?}{}",
         use_user,
         use_pid,
         use_mnt,
         _use_net,
         cli.readonly,
         cli.no_proc,
-        cli.new_root,
         cli.workdir,
         cli.hostname,
+        cli.new_root,
         cli.bind,
+        // append reactor flag only when it's defined (i.e., in debug builds)
         {
             #[cfg(feature = "debug")]
             {
@@ -164,6 +153,7 @@ fn main() {
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
 
+        // new root (host dir that becomes `/` inside the sandbox)
         new_root: cli.new_root.as_deref().map(Into::into),
 
         // existing toggles

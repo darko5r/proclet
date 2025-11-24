@@ -51,18 +51,6 @@ pub struct Cli {
     #[arg(long)]
     pub no_proc: bool,
 
-    /// Use PATH as the new filesystem root (like a lightweight chroot).
-    ///
-    /// Internally, proclet will:
-    ///   - unshare the mount namespace,
-    ///   - bind-mount PATH on itself,
-    ///   - move that mount tree to `/`,
-    ///   - and chdir("/") inside the sandbox.
-    ///
-    /// Requires that `mnt` is included in `--ns`.
-    #[arg(long = "new-root")]
-    pub new_root: Option<String>,
-
     /// Set working directory inside the sandbox (after namespaces)
     #[arg(long)]
     pub workdir: Option<String>,
@@ -82,7 +70,23 @@ pub struct Cli {
     #[arg(long)]
     pub readonly: bool,
 
-    /// Command to run (use `--` before it)
+    /// Use the given host directory as the sandbox root (inside it, `/` becomes this dir).
+    ///
+    /// Roughly similar to bubblewrap:
+    ///   bwrap --ro-bind /path / --chdir /
+    ///
+    /// Notes:
+    /// - The directory must exist already (for now).
+    /// - Bind mounts that target absolute paths will be mapped *inside* this new root.
+    #[arg(long = "new-root")]
+    pub new_root: Option<String>,
+
+    /// Command to run (use `--` before it).
+    ///
+    /// Example:
+    ///   proclet --ns user,pid,mnt -- /bin/bash -lc 'id'
+    ///
+    /// Do NOT add an extra `--` inside the command itself.
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
 }
