@@ -66,27 +66,31 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub bind: Vec<String>,
 
-    /// Make root filesystem read-only (remount / as MS_RDONLY)
+    /// Make root filesystem read-only (remount / as MS_RDONLY, or new-root if specified)
     #[arg(long)]
     pub readonly: bool,
 
-    /// Use the given host directory as the sandbox root (inside it, `/` becomes this dir).
+    /// Use an existing directory as the sandbox root (like bwrap --ro-bind /root /).
     ///
-    /// Roughly similar to bubblewrap:
-    ///   bwrap --ro-bind /path / --chdir /
+    /// Example:
+    ///   proclet --ns user,pid,mnt --new-root /tmp/proclet-root -- /bin/bash
     ///
-    /// Notes:
-    /// - The directory must exist already (for now).
-    /// - Bind mounts that target absolute paths will be mapped *inside* this new root.
+    /// By itself, proclet expects you to populate this root (or combine with --new-root-auto).
     #[arg(long = "new-root")]
     pub new_root: Option<String>,
 
-    /// Command to run (use `--` before it).
+    /// Automatically populate the new root with core system directories using bind mounts.
     ///
-    /// Example:
-    ///   proclet --ns user,pid,mnt -- /bin/bash -lc 'id'
+    /// Behaviour:
+    ///   - If used together with --new-root, that directory is used and auto-populated.
+    ///   - If used alone, proclet creates a temporary dir under /tmp and uses that.
     ///
-    /// Do NOT add an extra `--` inside the command itself.
+    /// Core dirs currently bound (if they exist on the host):
+    ///   /usr, /bin, /sbin, /lib, /lib64
+    #[arg(long = "new-root-auto")]
+    pub new_root_auto: bool,
+
+    /// Command to run (use `--` before it)
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
 }

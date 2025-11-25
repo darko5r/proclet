@@ -16,16 +16,18 @@
 
 #![allow(clippy::needless_return)]
 #[cfg(not(feature = "core"))]
-compile_error!(
-    "proclet currently requires the `core` feature. Build with default features or enable `--features core`."
-);
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
 
 mod cli;
 
 use clap::Parser;
 use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
-use std::ffi::CString;
+use std::{
+    ffi::CString,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 // ---------- feature gates as booleans ----------
 #[cfg(feature = "net")]
@@ -90,30 +92,27 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
-    // --- Sanity check: avoid the old `-- -- cmd` pattern ---
+    // Build command argv, but reject invalid leading "--".
     if let Some(first) = cli.cmd.first() {
         if first == "--" {
             eprintln!(
                 "proclet: invalid command vector (starts with `--`).\n\
                  Hint: do NOT pass an extra `--` *inside* the command.\n\
-                 Example:\n\
-                 \n\
+                 Example:\n\n\
                  \t# bad\n\
-                 \tproclet --ns user,pid,mnt -- -- id\n\
-                 \n\
+                 \tproclet --ns user,pid,mnt -- -- id\n\n\
                  \t# good\n\
                  \tproclet --ns user,pid,mnt -- id\n"
             );
-            std::process::exit(64); // EX_USAGE
+            std::process::exit(64);
         }
     }
 
-    let cargs: Vec<CString> =
-        cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
     let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
@@ -121,10 +120,30 @@ fn main() {
         std::process::exit(64);
     }
 
+    // --- Handle new-root / new-root-auto wiring ---
+    let mut new_root: Option<PathBuf> = cli.new_root.as_deref().map(Into::into);
+
+    if cli.new_root_auto && new_root.is_none() {
+        // Create a simple temp dir under /tmp: /tmp/proclet-<pid>-<nanos>
+        let base = std::path::Path::new("/tmp");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let dir = base.join(format!("proclet-{}-{nanos}", std::process::id()));
+
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("proclet: failed to create auto new-root dir {:?}: {e}", dir);
+            std::process::exit(1);
+        }
+
+        new_root = Some(dir);
+    }
+
     // Optional debug dump (only if built with --features debug)
     dbgln!(
         "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, \
-         workdir={:?}, hostname={:?}, new_root={:?}, binds={:?}{}",
+         workdir={:?}, hostname={:?}, binds={:?}, new_root={:?}, new_root_auto={}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -133,9 +152,9 @@ fn main() {
         cli.no_proc,
         cli.workdir,
         cli.hostname,
-        cli.new_root,
         cli.bind,
-        // append reactor flag only when it's defined (i.e., in debug builds)
+        new_root.as_deref(),
+        cli.new_root_auto,
         {
             #[cfg(feature = "debug")]
             {
@@ -153,15 +172,16 @@ fn main() {
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
 
-        // new root (host dir that becomes `/` inside the sandbox)
-        new_root: cli.new_root.as_deref().map(Into::into),
-
         // existing toggles
         use_user,
         use_pid,
         use_mnt,
         readonly_root: cli.readonly,
         binds: parse_binds(&cli.bind),
+
+        // new-root options
+        new_root,
+        new_root_auto: cli.new_root_auto,
     };
 
     match run_pid_mount(&cargs, &opts) {
