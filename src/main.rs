@@ -24,9 +24,9 @@ use clap::Parser;
 use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
 use std::{
+    env,
     ffi::CString,
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf},
 };
 
 // ---------- feature gates as booleans ----------
@@ -56,7 +56,7 @@ macro_rules! dbgln {
 }
 
 // ---------- helpers ----------
-fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
+fn parse_binds(b: &[String]) -> Vec<(PathBuf, PathBuf, bool)> {
     // Syntax: /host:/inside[:ro]
     b.iter()
         .filter_map(|spec| {
@@ -68,6 +68,39 @@ fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, boo
             Some((parts[0].into(), parts[1].into(), ro))
         })
         .collect()
+}
+
+/// Resolve the shell for the special `auto-shell` pseudo-command.
+///
+/// Priority:
+///  1. $SHELL, if set and exists.
+///  2. /bin/zsh, /usr/bin/zsh
+///  3. /bin/bash, /usr/bin/bash
+///  4. /bin/sh (last-resort fallback)
+fn resolve_auto_shell() -> String {
+    if let Ok(shell) = env::var("SHELL") {
+        if !shell.is_empty() && Path::new(&shell).exists() {
+            return shell;
+        }
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+    ];
+
+    for c in CANDIDATES {
+        if Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+
+    // Extremely unlikely to reach here on a normal Linux system,
+    // but keep a hard fallback for completeness.
+    "/bin/sh".to_string()
 }
 
 fn main() {
@@ -92,15 +125,20 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
-    // Build command argv, but reject invalid leading "--".
-    if let Some(first) = cli.cmd.first() {
+    // Start from the raw command vector
+    let mut cmd: Vec<String> = cli.cmd.clone();
+
+    // Guard against "proclet ... -- -- something" mistakes
+    if let Some(first) = cmd.first() {
         if first == "--" {
             eprintln!(
                 "proclet: invalid command vector (starts with `--`).\n\
                  Hint: do NOT pass an extra `--` *inside* the command.\n\
-                 Example:\n\n\
+                 Example:\n\
+                 \n\
                  \t# bad\n\
-                 \tproclet --ns user,pid,mnt -- -- id\n\n\
+                 \tproclet --ns user,pid,mnt -- -- id\n\
+                 \n\
                  \t# good\n\
                  \tproclet --ns user,pid,mnt -- id\n"
             );
@@ -108,7 +146,35 @@ fn main() {
         }
     }
 
-    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    // Special pseudo-command: `auto-shell`
+    //
+    // Usage:
+    //     proclet [flags] -- auto-shell
+    //
+    // This resolves to:
+    //     proclet [flags] -- "$SHELL" -i
+    //
+    // with fallbacks to zsh/bash/sh if $SHELL is not set or missing.
+    if let Some(first) = cmd.first() {
+        if first == "auto-shell" {
+            if cmd.len() > 1 {
+                eprintln!(
+                    "proclet: `auto-shell` does not take extra arguments (yet).\n\
+                     Usage:\n\
+                     \tproclet [opts] -- auto-shell\n"
+                );
+                std::process::exit(64);
+            }
+
+            let shell = resolve_auto_shell();
+            dbgln!("proclet(debug): auto-shell resolved to {}", shell);
+
+            cmd = vec![shell, String::from("-i")];
+        }
+    }
+
+    // Now convert final cmd -> CString[]
+    let cargs: Vec<CString> = cstrings(&cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
     let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
@@ -120,30 +186,9 @@ fn main() {
         std::process::exit(64);
     }
 
-    // --- Handle new-root / new-root-auto wiring ---
-    let mut new_root: Option<PathBuf> = cli.new_root.as_deref().map(Into::into);
-
-    if cli.new_root_auto && new_root.is_none() {
-        // Create a simple temp dir under /tmp: /tmp/proclet-<pid>-<nanos>
-        let base = std::path::Path::new("/tmp");
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let dir = base.join(format!("proclet-{}-{nanos}", std::process::id()));
-
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("proclet: failed to create auto new-root dir {:?}: {e}", dir);
-            std::process::exit(1);
-        }
-
-        new_root = Some(dir);
-    }
-
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, \
-         workdir={:?}, hostname={:?}, binds={:?}, new_root={:?}, new_root_auto={}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -153,8 +198,7 @@ fn main() {
         cli.workdir,
         cli.hostname,
         cli.bind,
-        new_root.as_deref(),
-        cli.new_root_auto,
+        // append reactor flag only when it's defined (i.e., in debug builds)
         {
             #[cfg(feature = "debug")]
             {
@@ -167,7 +211,7 @@ fn main() {
         }
     );
 
-    let opts = ProcletOpts {
+        let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
@@ -179,8 +223,8 @@ fn main() {
         readonly_root: cli.readonly,
         binds: parse_binds(&cli.bind),
 
-        // new-root options
-        new_root,
+        // new-root controls
+        new_root: cli.new_root.as_ref().map(|s| PathBuf::from(s)),
         new_root_auto: cli.new_root_auto,
     };
 
