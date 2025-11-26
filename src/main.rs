@@ -92,17 +92,32 @@ fn print_info(msg: &str) {
 }
 
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
+    let use_color = stderr_is_tty();
+
+    let label = |s: &str| {
+        if use_color {
+            format!("\x1b[36m{s}\x1b[0m") // cyan
+        } else {
+            s.to_string()
+        }
+    };
+
     print_info("proclet: sandbox configuration");
 
     // Namespaces
     eprintln!(
-        "  ns: user={} pid={} mnt={} net={}",
-        use_user, use_pid, use_mnt, use_net
+        "  {} user={} pid={} mnt={} net={}",
+        label("ns:   "),
+        use_user,
+        use_pid,
+        use_mnt,
+        use_net
     );
 
     // Root / proc
     eprintln!(
-        "  root: mount_proc={} readonly_root={}",
+        "  {} mount_proc={} readonly_root={}",
+        label("root:"),
         !cli.no_proc,
         cli.readonly
     );
@@ -114,17 +129,21 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
         (None, true) => String::from("auto-temp under /tmp"),
         (None, false) => String::from("<host />"),
     };
-    eprintln!("  new-root: {root_desc}");
+    eprintln!("  {} {}", label("new-root:"), root_desc);
 
     // Workdir / hostname
-    eprintln!("  workdir:  {:?}", cli.workdir.as_deref());
-    eprintln!("  hostname: {:?}", cli.hostname);
+    eprintln!(
+        "  {} {:?}",
+        label("workdir:"),
+        cli.workdir.as_deref()
+    );
+    eprintln!("  {} {:?}", label("hostname:"), cli.hostname);
 
     // Binds
     if cli.bind.is_empty() {
-        eprintln!("  binds:    []");
+        eprintln!("  {} []", label("binds:"));
     } else {
-        eprintln!("  binds:");
+        eprintln!("  {}", label("binds:"));
         for b in &cli.bind {
             eprintln!("    - {b}");
         }
