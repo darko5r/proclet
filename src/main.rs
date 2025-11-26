@@ -15,6 +15,7 @@
  */
 
 #![allow(clippy::needless_return)]
+
 #[cfg(not(feature = "core"))]
 compile_error!(
     "proclet currently requires the `core` feature. \
@@ -97,7 +98,8 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
     // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
+            // cyan "ns:" / "root:" / "new-root:" ...
+            format!("\x1b[36m{}:\x1b[0m", s)
         } else {
             format!("{}:", s)
         }
@@ -156,18 +158,14 @@ fn main() {
 
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
-        print_error(
-            "this binary was built without the `net` feature (requested --ns net).\n\
-             Rebuild with: cargo build --features net",
-        );
+        print_error("this binary was built without the `net` feature (requested --ns net).");
+        eprintln!("       Rebuild with: cargo build --features net");
         std::process::exit(64); // EX_USAGE
     }
 
     if cli.hostname.is_some() && !FEATURE_UTS {
-        print_error(
-            "setting hostname requires the `uts` feature (requested --hostname ...).\n\
-             Rebuild with: cargo build --features uts",
-        );
+        print_error("setting hostname requires the `uts` feature (requested --hostname ...).");
+        eprintln!("       Rebuild with: cargo build --features uts");
         std::process::exit(64); // EX_USAGE
     }
 
@@ -189,9 +187,9 @@ fn main() {
     let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_net  = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
         print_error("currently requires ns=pid,mnt (others coming soon).");
@@ -210,7 +208,6 @@ fn main() {
         cli.workdir,
         cli.hostname,
         cli.bind,
-        // append reactor flag only when it's defined (i.e., in debug builds)
         {
             #[cfg(feature = "debug")]
             {
@@ -253,3 +250,4 @@ fn main() {
         }
     }
 }
+
