@@ -94,11 +94,12 @@ fn print_info(msg: &str) {
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
     let use_color = stderr_is_tty();
 
+    // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            format!("\x1b[36m{s}\x1b[0m") // cyan
+            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
         } else {
-            s.to_string()
+            format!("{}:", s)
         }
     };
 
@@ -106,47 +107,47 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     // Namespaces
     eprintln!(
-        "  {} user={} pid={} mnt={} net={}",
-        label("ns:   "),
-        use_user,
-        use_pid,
-        use_mnt,
-        use_net
+        "  {} {}",
+        label("ns"),
+        format!(
+            "user={} pid={} mnt={} net={}",
+            use_user, use_pid, use_mnt, use_net
+        )
     );
 
-    // Root / proc
+    // Root section
     eprintln!(
-        "  {} mount_proc={} readonly_root={}",
-        label("root:"),
-        !cli.no_proc,
-        cli.readonly
+        "  {} {}",
+        label("root"),
+        format!(
+            "mount_proc={} readonly_root={}",
+            !cli.no_proc,
+            cli.readonly
+        )
     );
 
-    // new-root
+    // new-root section
     let root_desc = match (&cli.new_root, cli.new_root_auto) {
         (Some(path), true) => format!("{} (explicit) + auto-temp", path),
         (Some(path), false) => path.clone(),
         (None, true) => String::from("auto-temp under /tmp"),
         (None, false) => String::from("<host />"),
     };
-    eprintln!("  {} {}", label("new-root:"), root_desc);
+    eprintln!("  {} {}", label("new-root"), root_desc);
 
-    // Workdir / hostname
-    eprintln!(
-        "  {} {:?}",
-        label("workdir:"),
-        cli.workdir.as_deref()
-    );
-    eprintln!("  {} {:?}", label("hostname:"), cli.hostname);
+    // workdir / hostname
+    eprintln!("  {} {:?}", label("workdir"), cli.workdir.as_deref());
+    eprintln!("  {} {:?}", label("hostname"), cli.hostname);
 
-    // Binds
+    // binds
     if cli.bind.is_empty() {
-        eprintln!("  {} []", label("binds:"));
+        eprintln!("  {} []", label("binds"));
     } else {
-        eprintln!("  {}", label("binds:"));
+        eprintln!("  {} [", label("binds"));
         for b in &cli.bind {
-            eprintln!("    - {b}");
+            eprintln!("    {b}");
         }
+        eprintln!("  ]");
     }
 }
 
