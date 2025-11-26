@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum Ns {
@@ -47,6 +47,13 @@ pub struct Cli {
     )]
     pub ns: Vec<Ns>,
 
+    /// Increase verbosity (-v, -vv)
+    ///
+    /// -v  : show a one-line summary of the sandbox
+    /// -vv : also show some extra details (reserved for future use)
+    #[arg(short, long, action = ArgAction::Count)]
+    pub verbose: u8,
+
     /// Do NOT mount a fresh /proc (only valid if Mnt is enabled)
     #[arg(long)]
     pub no_proc: bool,
@@ -66,27 +73,16 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub bind: Vec<String>,
 
-    /// Make root filesystem read-only (remount / as MS_RDONLY, or new-root if specified)
+    /// Make root filesystem read-only (remount / as MS_RDONLY)
     #[arg(long)]
     pub readonly: bool,
 
-    /// Use an existing directory as the sandbox root (like bwrap --ro-bind /root /).
-    ///
-    /// Example:
-    ///   proclet --ns user,pid,mnt --new-root /tmp/proclet-root -- /bin/bash
-    ///
-    /// By itself, proclet expects you to populate this root (or combine with --new-root-auto).
+    /// New root directory inside the sandbox (bind-mount to /).
+    /// Rough analogue of bubblewrap's --ro-bind /path / --chdir /.
     #[arg(long = "new-root")]
     pub new_root: Option<String>,
 
-    /// Automatically populate the new root with core system directories using bind mounts.
-    ///
-    /// Behaviour:
-    ///   - If used together with --new-root, that directory is used and auto-populated.
-    ///   - If used alone, proclet creates a temporary dir under /tmp and uses that.
-    ///
-    /// Core dirs currently bound (if they exist on the host):
-    ///   /usr, /bin, /sbin, /lib, /lib64
+    /// Automatically create a temporary new-root under /tmp (e.g. /tmp/proclet-XXXXXX).
     #[arg(long = "new-root-auto")]
     pub new_root_auto: bool,
 

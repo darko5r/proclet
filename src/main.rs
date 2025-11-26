@@ -16,18 +16,17 @@
 
 #![allow(clippy::needless_return)]
 #[cfg(not(feature = "core"))]
-compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
+compile_error!(
+    "proclet currently requires the `core` feature. \
+     Build with default features or enable `--features core`."
+);
 
 mod cli;
 
 use clap::Parser;
 use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
-use std::{
-    env,
-    ffi::CString,
-    path::{Path, PathBuf},
-};
+use std::ffi::CString;
 
 // ---------- feature gates as booleans ----------
 #[cfg(feature = "net")]
@@ -56,7 +55,8 @@ macro_rules! dbgln {
 }
 
 // ---------- helpers ----------
-fn parse_binds(b: &[String]) -> Vec<(PathBuf, PathBuf, bool)> {
+
+fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
     // Syntax: /host:/inside[:ro]
     b.iter()
         .filter_map(|spec| {
@@ -70,37 +70,65 @@ fn parse_binds(b: &[String]) -> Vec<(PathBuf, PathBuf, bool)> {
         .collect()
 }
 
-/// Resolve the shell for the special `auto-shell` pseudo-command.
-///
-/// Priority:
-///  1. $SHELL, if set and exists.
-///  2. /bin/zsh, /usr/bin/zsh
-///  3. /bin/bash, /usr/bin/bash
-///  4. /bin/sh (last-resort fallback)
-fn resolve_auto_shell() -> String {
-    if let Ok(shell) = env::var("SHELL") {
-        if !shell.is_empty() && Path::new(&shell).exists() {
-            return shell;
+fn stderr_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
+
+fn print_error(msg: &str) {
+    if stderr_is_tty() {
+        eprintln!("\x1b[31merror:\x1b[0m {msg}");
+    } else {
+        eprintln!("error: {msg}");
+    }
+}
+
+fn print_info(msg: &str) {
+    if stderr_is_tty() {
+        eprintln!("\x1b[36m{msg}\x1b[0m");
+    } else {
+        eprintln!("{msg}");
+    }
+}
+
+fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
+    print_info("proclet: sandbox configuration");
+
+    // Namespaces
+    eprintln!(
+        "  ns: user={} pid={} mnt={} net={}",
+        use_user, use_pid, use_mnt, use_net
+    );
+
+    // Root / proc
+    eprintln!(
+        "  root: mount_proc={} readonly_root={}",
+        !cli.no_proc,
+        cli.readonly
+    );
+
+    // new-root
+    let root_desc = match (&cli.new_root, cli.new_root_auto) {
+        (Some(path), true) => format!("{} (explicit) + auto-temp", path),
+        (Some(path), false) => path.clone(),
+        (None, true) => String::from("auto-temp under /tmp"),
+        (None, false) => String::from("<host />"),
+    };
+    eprintln!("  new-root: {root_desc}");
+
+    // Workdir / hostname
+    eprintln!("  workdir:  {:?}", cli.workdir.as_deref());
+    eprintln!("  hostname: {:?}", cli.hostname);
+
+    // Binds
+    if cli.bind.is_empty() {
+        eprintln!("  binds:    []");
+    } else {
+        eprintln!("  binds:");
+        for b in &cli.bind {
+            eprintln!("    - {b}");
         }
     }
-
-    const CANDIDATES: &[&str] = &[
-        "/bin/zsh",
-        "/usr/bin/zsh",
-        "/bin/bash",
-        "/usr/bin/bash",
-        "/bin/sh",
-    ];
-
-    for c in CANDIDATES {
-        if Path::new(c).exists() {
-            return c.to_string();
-        }
-    }
-
-    // Extremely unlikely to reach here on a normal Linux system,
-    // but keep a hard fallback for completeness.
-    "/bin/sh".to_string()
 }
 
 fn main() {
@@ -108,81 +136,45 @@ fn main() {
 
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
-        eprintln!(
-            "proclet: this binary was built without the `net` feature.\n\
-             Rebuild with: cargo build --features net\n\
-             (requested: --ns net)"
+        print_error(
+            "this binary was built without the `net` feature (requested --ns net).\n\
+             Rebuild with: cargo build --features net",
         );
         std::process::exit(64); // EX_USAGE
     }
 
     if cli.hostname.is_some() && !FEATURE_UTS {
-        eprintln!(
-            "proclet: setting hostname requires the `uts` feature.\n\
-             Rebuild with: cargo build --features uts\n\
-             (requested: --hostname ...)"
+        print_error(
+            "setting hostname requires the `uts` feature (requested --hostname ...).\n\
+             Rebuild with: cargo build --features uts",
         );
         std::process::exit(64); // EX_USAGE
     }
 
-    // Start from the raw command vector
-    let mut cmd: Vec<String> = cli.cmd.clone();
-
-    // Guard against "proclet ... -- -- something" mistakes
-    if let Some(first) = cmd.first() {
+    // Validate command vector (common mistake: extra `--` inside cmd)
+    if let Some(first) = cli.cmd.first() {
         if first == "--" {
-            eprintln!(
-                "proclet: invalid command vector (starts with `--`).\n\
-                 Hint: do NOT pass an extra `--` *inside* the command.\n\
-                 Example:\n\
-                 \n\
-                 \t# bad\n\
-                 \tproclet --ns user,pid,mnt -- -- id\n\
-                 \n\
-                 \t# good\n\
-                 \tproclet --ns user,pid,mnt -- id\n"
-            );
+            print_error("invalid command vector (starts with `--`).");
+            eprintln!("Hint: do NOT pass an extra `--` *inside* the command.");
+            eprintln!();
+            eprintln!("\t# bad");
+            eprintln!("\tproclet --ns user,pid,mnt -- -- id");
+            eprintln!();
+            eprintln!("\t# good");
+            eprintln!("\tproclet --ns user,pid,mnt -- id");
             std::process::exit(64);
         }
     }
 
-    // Special pseudo-command: `auto-shell`
-    //
-    // Usage:
-    //     proclet [flags] -- auto-shell
-    //
-    // This resolves to:
-    //     proclet [flags] -- "$SHELL" -i
-    //
-    // with fallbacks to zsh/bash/sh if $SHELL is not set or missing.
-    if let Some(first) = cmd.first() {
-        if first == "auto-shell" {
-            if cmd.len() > 1 {
-                eprintln!(
-                    "proclet: `auto-shell` does not take extra arguments (yet).\n\
-                     Usage:\n\
-                     \tproclet [opts] -- auto-shell\n"
-                );
-                std::process::exit(64);
-            }
-
-            let shell = resolve_auto_shell();
-            dbgln!("proclet(debug): auto-shell resolved to {}", shell);
-
-            cmd = vec![shell, String::from("-i")];
-        }
-    }
-
-    // Now convert final cmd -> CString[]
-    let cargs: Vec<CString> = cstrings(&cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let _use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
-        eprintln!("proclet: currently requires ns=pid,mnt (others coming soon)");
+        print_error("currently requires ns=pid,mnt (others coming soon).");
         std::process::exit(64);
     }
 
@@ -192,7 +184,7 @@ fn main() {
         use_user,
         use_pid,
         use_mnt,
-        _use_net,
+        use_net,
         cli.readonly,
         cli.no_proc,
         cli.workdir,
@@ -211,7 +203,12 @@ fn main() {
         }
     );
 
-        let opts = ProcletOpts {
+    // Verbose summary (Phase 2 feature)
+    if cli.verbose > 0 {
+        print_summary(&cli, use_user, use_pid, use_mnt, use_net);
+    }
+
+    let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
@@ -223,15 +220,15 @@ fn main() {
         readonly_root: cli.readonly,
         binds: parse_binds(&cli.bind),
 
-        // new-root controls
-        new_root: cli.new_root.as_ref().map(|s| PathBuf::from(s)),
+        // new-root knobs (you already wired these in lib.rs)
+        new_root: cli.new_root.as_ref().map(Into::into),
         new_root_auto: cli.new_root_auto,
     };
 
     match run_pid_mount(&cargs, &opts) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("proclet: failed to start: {e}");
+            print_error(&format!("failed to start: {e}"));
             std::process::exit(1);
         }
     }
