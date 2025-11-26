@@ -33,10 +33,11 @@ use nix::{
     },
     unistd::{chdir, chroot, execvp, fork, ForkResult},
 };
+
 use std::{
     ffi::CString,
     fs::OpenOptions,
-    io::Write,
+    io::{self, Write, IsTerminal},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
@@ -49,6 +50,18 @@ macro_rules! dbgln {
 #[cfg(not(feature = "debug"))]
 macro_rules! dbgln {
     ($($t:tt)*) => {};
+}
+
+fn stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
+}
+
+fn log_error(msg: &str) {
+    if stderr_is_terminal() {
+        eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
+    } else {
+        eprintln!("proclet: {msg}");
+    }
 }
 
 #[inline]
@@ -421,7 +434,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 ForkResult::Child => {
                     // Exec the target (on success, never returns)
                     let e = execvp(&argv[0], argv).unwrap_err();
-                    eprintln!("proclet: exec failed: {e}");
+                    log_error(&format!("exec failed: {e}"));
                     std::process::exit(127);
                 }
                 ForkResult::Parent { child } => {
@@ -509,7 +522,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                             Ok(None) => continue, // nothing to read (blocking fd, so unlikely)
                             Err(e) if e == Errno::EINTR => continue,
                             Err(e) => {
-                                eprintln!("proclet: signalfd error: {e}");
+                                log_error(&format!("signalfd error: {e}"));
                                 // Fallback: try reaping; if direct child is gone, exit with its code
                                 if let Some(code) = reap_all(child.as_raw())? {
                                     tty_guard.restore();
@@ -566,7 +579,7 @@ pub fn cstrings(args: &[&str]) -> Vec<CString> {
         match CString::new((*s).as_bytes()) {
             Ok(c) => out.push(c),
             Err(_) => {
-                eprintln!("proclet: argument contains interior NUL byte: {:?}", s);
+                log_error(&format!("argument contains interior NUL byte: {:?}", s));
                 std::process::exit(64);
             }
         }

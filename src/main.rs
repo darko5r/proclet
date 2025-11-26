@@ -27,6 +27,7 @@ use clap::Parser;
 use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
 use std::ffi::CString;
+use std::io::{self, IsTerminal};
 
 // ---------- feature gates as booleans ----------
 #[cfg(feature = "net")]
@@ -70,21 +71,20 @@ fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, boo
         .collect()
 }
 
-fn stderr_is_tty() -> bool {
-    use std::io::IsTerminal;
-    std::io::stderr().is_terminal()
+fn stderr_is_terminal() -> bool {
+    io::stderr().is_terminal()
 }
 
 fn print_error(msg: &str) {
-    if stderr_is_tty() {
-        eprintln!("\x1b[31merror:\x1b[0m {msg}");
+    if stderr_is_terminal() {
+        eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
     } else {
-        eprintln!("error: {msg}");
+        eprintln!("proclet: {msg}");
     }
 }
 
 fn print_info(msg: &str) {
-    if stderr_is_tty() {
+    if stderr_is_terminal() {
         eprintln!("\x1b[36m{msg}\x1b[0m");
     } else {
         eprintln!("{msg}");
@@ -92,7 +92,7 @@ fn print_info(msg: &str) {
 }
 
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
-    let use_color = stderr_is_tty();
+    let use_color = stderr_is_terminal();
 
     // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
@@ -240,7 +240,7 @@ fn main() {
         readonly_root: cli.readonly,
         binds: parse_binds(&cli.bind),
 
-        // new-root knobs (you already wired these in lib.rs)
+        // new-root knobs
         new_root: cli.new_root.as_ref().map(Into::into),
         new_root_auto: cli.new_root_auto,
     };
