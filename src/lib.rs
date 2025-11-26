@@ -20,10 +20,7 @@
 /// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
 /// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
-compile_error!(
-    "proclet currently requires the `core` feature. \
-     Build with default features or enable `--features core`."
-);
+compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
 
 use nix::{
     errno::Errno,
@@ -59,7 +56,7 @@ fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
 
-fn print_error(msg: &str) {
+fn log_error(msg: &str) {
     if stderr_is_terminal() {
         eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
     } else {
@@ -437,7 +434,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 ForkResult::Child => {
                     // Exec the target (on success, never returns)
                     let e = execvp(&argv[0], argv).unwrap_err();
-                    print_error(&format!("exec failed: {e}"));
+                    log_error(&format!("exec failed: {e}"));
                     std::process::exit(127);
                 }
                 ForkResult::Parent { child } => {
@@ -525,7 +522,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                             Ok(None) => continue, // nothing to read (blocking fd, so unlikely)
                             Err(e) if e == Errno::EINTR => continue,
                             Err(e) => {
-                                print_error(&format!("signalfd error: {e}"));
+                                log_error(&format!("signalfd error: {e}"));
                                 // Fallback: try reaping; if direct child is gone, exit with its code
                                 if let Some(code) = reap_all(child.as_raw())? {
                                     tty_guard.restore();
@@ -582,7 +579,7 @@ pub fn cstrings(args: &[&str]) -> Vec<CString> {
         match CString::new((*s).as_bytes()) {
             Ok(c) => out.push(c),
             Err(_) => {
-                print_error(&format!("argument contains interior NUL byte: {:?}", s));
+                log_error(&format!("argument contains interior NUL byte: {:?}", s));
                 std::process::exit(64);
             }
         }

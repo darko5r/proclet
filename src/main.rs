@@ -15,7 +15,6 @@
  */
 
 #![allow(clippy::needless_return)]
-
 #[cfg(not(feature = "core"))]
 compile_error!(
     "proclet currently requires the `core` feature. \
@@ -27,8 +26,12 @@ mod cli;
 use clap::Parser;
 use cli::{Cli, Ns};
 use proclet::{cstrings, run_pid_mount, ProcletOpts};
-use std::ffi::CString;
-use std::io::{self, IsTerminal};
+use std::{
+    env,
+    ffi::CString,
+    io::{self, IsTerminal},
+    path::Path,
+};
 
 // ---------- feature gates as booleans ----------
 #[cfg(feature = "net")]
@@ -84,6 +87,14 @@ fn print_error(msg: &str) {
     }
 }
 
+fn print_warn(msg: &str) {
+    if stderr_is_terminal() {
+        eprintln!("\x1b[33mproclet: {msg}\x1b[0m");
+    } else {
+        eprintln!("proclet: {msg}");
+    }
+}
+
 fn print_info(msg: &str) {
     if stderr_is_terminal() {
         eprintln!("\x1b[36m{msg}\x1b[0m");
@@ -92,14 +103,87 @@ fn print_info(msg: &str) {
     }
 }
 
+/// Best-effort PATH lookup to warn about obviously missing commands.
+fn cmd_in_path(cmd: &str) -> bool {
+    if cmd.contains('/') {
+        // Explicit path: let execvp handle it; we just check existence.
+        let p = Path::new(cmd);
+        return p.is_file();
+    }
+
+    let path = match env::var_os("PATH") {
+        Some(p) => p,
+        None => return false,
+    };
+
+    for dir in env::split_paths(&path) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build final argv with “smart” fixes:
+/// - Drop accidental leading `--`
+/// - Drop empty args
+/// - If empty after cleanup → fallback to /bin/sh
+/// - If cmd[0] contains '/' and is relative → expand to absolute (canonicalize)
+/// - Warn if command not found in PATH
+fn build_argv(cli: &Cli) -> Vec<CString> {
+    // Start from the raw CLI vector
+    let mut raw = cli.cmd.clone();
+
+    // 1) Fix accidental double `--`
+    if raw.first().map(|s| s.as_str()) == Some("--") {
+        print_warn("command vector started with `--`; dropping it (did you pass an extra `--`?)");
+        raw.remove(0);
+    }
+
+    // 2) Drop empty strings (weird splitting, accidental quotes, etc.)
+    raw.retain(|s| !s.is_empty());
+
+    // 3) Fallback: if still empty, default to /bin/sh
+    if raw.is_empty() {
+        print_warn("no command supplied; falling back to /bin/sh");
+        raw.push("/bin/sh".to_string());
+    }
+
+    // 4) Expand relative paths in cmd[0] (if it contains '/', but isn't absolute)
+    if let Some(first) = raw.first_mut() {
+        if first.contains('/') {
+            let p = Path::new(first);
+            if !p.is_absolute() {
+                if let Ok(abs) = std::fs::canonicalize(p) {
+                    *first = abs.to_string_lossy().into_owned();
+                    dbgln!("proclet(debug): expanded cmd[0] to {:?}", first);
+                }
+            }
+        }
+    }
+
+    // 5) Warn if command is obviously missing from PATH / filesystem
+    if let Some(cmd0) = raw.first() {
+        if !cmd_in_path(cmd0) {
+            print_warn(&format!(
+                "command `{}` not found in PATH or as a file; exec may fail with ENOENT",
+                cmd0
+            ));
+        }
+    }
+
+    // 6) Convert to CString for execvp (library helper)
+    cstrings(&raw.iter().map(|s| s.as_str()).collect::<Vec<_>>())
+}
+
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
     let use_color = stderr_is_terminal();
 
     // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            // cyan "ns:" / "root:" / "new-root:" ...
-            format!("\x1b[36m{}:\x1b[0m", s)
+            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
         } else {
             format!("{}:", s)
         }
@@ -130,9 +214,9 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     // new-root section
     let root_desc = match (&cli.new_root, cli.new_root_auto) {
-        (Some(path), true) => format!("{} (explicit) + auto-temp", path),
+        (Some(path), true) => format!("{} (explicit) + auto-core-dirs", path),
         (Some(path), false) => path.clone(),
-        (None, true) => String::from("auto-temp under /tmp"),
+        (None, true) => String::from("auto-core-dirs under /tmp"),
         (None, false) => String::from("<host />"),
     };
     eprintln!("  {} {}", label("new-root"), root_desc);
@@ -158,38 +242,27 @@ fn main() {
 
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
-        print_error("this binary was built without the `net` feature (requested --ns net).");
-        eprintln!("       Rebuild with: cargo build --features net");
+        print_error(
+            "this binary was built without the `net` feature (requested --ns net).\n\
+             Rebuild with: cargo build --features net",
+        );
         std::process::exit(64); // EX_USAGE
     }
 
     if cli.hostname.is_some() && !FEATURE_UTS {
-        print_error("setting hostname requires the `uts` feature (requested --hostname ...).");
-        eprintln!("       Rebuild with: cargo build --features uts");
+        print_error(
+            "setting hostname requires the `uts` feature (requested --hostname ...).\n\
+             Rebuild with: cargo build --features uts",
+        );
         std::process::exit(64); // EX_USAGE
     }
 
-    // Validate command vector (common mistake: extra `--` inside cmd)
-    if let Some(first) = cli.cmd.first() {
-        if first == "--" {
-            print_error("invalid command vector (starts with `--`).");
-            eprintln!("Hint: do NOT pass an extra `--` *inside* the command.");
-            eprintln!();
-            eprintln!("\t# bad");
-            eprintln!("\tproclet --ns user,pid,mnt -- -- id");
-            eprintln!();
-            eprintln!("\t# good");
-            eprintln!("\tproclet --ns user,pid,mnt -- id");
-            std::process::exit(64);
-        }
-    }
-
-    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let cargs: Vec<CString> = build_argv(&cli);
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid  = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt  = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let use_net  = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
 
     if !use_pid || !use_mnt {
         print_error("currently requires ns=pid,mnt (others coming soon).");
@@ -198,7 +271,7 @@ fn main() {
 
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds:{:?}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -250,4 +323,3 @@ fn main() {
         }
     }
 }
-
