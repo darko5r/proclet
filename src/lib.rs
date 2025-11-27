@@ -282,7 +282,7 @@ impl TtyGuard {
             guard.had_tty = true;
             dbgln!("proclet(debug): tty foreground -> pgid {}", payload_pgid);
             vprintln(
-                2,
+                3,
                 opts,
                 &format!("tty: foreground -> payload pgid {}", payload_pgid),
             );
@@ -526,7 +526,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 ForkResult::Child => {
                     // Exec the target (on success, never returns)
                     vprintln(
-                        2,
+                        3,
                         opts,
                         &format!("execvp({}, ...)", argv[0].to_string_lossy()),
                     );
