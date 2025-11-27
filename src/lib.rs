@@ -20,7 +20,9 @@
 /// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
 /// _______________________________________________________________________________________________________________________
 #[cfg(not(feature = "core"))]
-compile_error!("proclet currently requires the `core` feature. Build with default features or enable `--features core`."); 
+compile_error!(
+    "proclet currently requires the `core` feature. Build with default features or enable `--features core`."
+);
 
 use nix::{
     errno::Errno,
@@ -45,12 +47,16 @@ use std::{
 // ---- debug helper (enabled only with `--features debug`) ----
 #[cfg(feature = "debug")]
 macro_rules! dbgln {
-    ($($t:tt)*) => { eprintln!($($t)*); }
+    ($($t:tt)*) => {
+        eprintln!($($t)*);
+    };
 }
 #[cfg(not(feature = "debug"))]
 macro_rules! dbgln {
     ($($t:tt)*) => {};
 }
+
+// ---- common logging helpers ----
 
 fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
@@ -64,81 +70,7 @@ fn log_error(msg: &str) {
     }
 }
 
-#[inline]
-fn to_errno(e: std::io::Error) -> Errno {
-    Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
-}
-
-fn write_file(path: &str, s: &str) -> Result<(), Errno> {
-    let mut f = OpenOptions::new().write(true).open(path).map_err(to_errno)?;
-    f.write_all(s.as_bytes()).map_err(to_errno)
-}
-
-/// _________________________________________________________________________________
-/// Enter a new user namespace and map the real UID/GID to root (0) inside it.
-/// This gives the process root-like privileges *within* the sandbox, without
-/// needing real root permissions on the host.
-///
-/// Acts as a safety net: if we’re already real root outside, skip userns entirely,
-/// since there’s no need to remap anything for mounts or capabilities.
-/// _________________________________________________________________________________
-fn enter_userns_map_root() -> Result<(), Errno> {
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-
-    // If running as real root, just don't use a user namespace.
-    if euid == 0 {
-        dbgln!("proclet(debug): skipping userns (already root)");
-        return Ok(());
-    }
-
-    dbgln!("proclet(debug): unshare(CLONE_NEWUSER)");
-    unshare(CloneFlags::CLONE_NEWUSER)?;
-
-    // On unprivileged paths, kernel requires setgroups=deny before gid_map
-    // Ignore ENOENT/EINVAL here (some kernels/filesystems differ)
-    let _ = write_file("/proc/self/setgroups", "deny\n");
-
-    let uid = euid as u32;
-    let gid = egid as u32;
-
-    write_file("/proc/self/uid_map", &format!("0 {uid} 1\n"))?;
-    write_file("/proc/self/gid_map", &format!("0 {gid} 1\n"))?;
-
-    Ok(())
-}
-
-// ---- UTS helpers (only compiled when `--features uts`) ----
-#[cfg(feature = "uts")]
-fn maybe_enter_uts_ns_if_needed(hostname: &Option<String>) -> Result<(), Errno> {
-    if hostname.is_some() {
-        dbgln!("proclet(debug): unshare(CLONE_NEWUTS) for hostname");
-        unshare(CloneFlags::CLONE_NEWUTS)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "uts"))]
-fn maybe_enter_uts_ns_if_needed(_hostname: &Option<String>) -> Result<(), Errno> {
-    Ok(())
-}
-
-/// Preflight: if `--hostname` is requested, ensure we can call sethostname().
-/// Rule of thumb:
-/// - with `--ns user`, non-root callers gain in-ns caps and can set hostname;
-/// - without userns, you must be real root on the host.
-#[cfg(feature = "uts")]
-fn ensure_hostname_possible(use_user: bool) -> Result<(), Errno> {
-    if !use_user {
-        let euid = unsafe { libc::geteuid() };
-        if euid != 0 {
-            return Err(Errno::EPERM);
-        }
-    }
-    Ok(())
-}
-
-/// Runtime options for Proclet.
+// Runtime options for Proclet.
 #[derive(Debug, Default, Clone)]
 pub struct ProcletOpts {
     /// Remount a fresh `/proc` inside the sandbox. Disable for debugging.
@@ -162,11 +94,113 @@ pub struct ProcletOpts {
     /// If true, automatically bind core system dirs into new_root:
     /// /usr, /bin, /sbin, /lib, /lib64 (only ones that exist).
     pub new_root_auto: bool,
+
+    /// Verbosity level:
+    /// 0 = quiet (only errors)
+    /// 1 = CLI summary (printed in main.rs)
+    /// 2 = runtime trace (mounts, namespaces, etc.)
+    /// 3 = deep trace (signal loop details, extra info)
+    pub verbose: u8,
+}
+
+/// Verbose printing with levels:
+///   level 2 => shown with -vv and -vvv
+///   level 3 => shown with -vvv only
+fn vprintln(level: u8, opts: &ProcletOpts, msg: &str) {
+    if opts.verbose >= level {
+        if stderr_is_terminal() {
+            eprintln!("\x1b[2m[v{}] {}\x1b[0m", level, msg); // dim gray
+        } else {
+            eprintln!("[v{}] {}", level, msg);
+        }
+    }
+}
+
+#[inline]
+fn to_errno(e: std::io::Error) -> Errno {
+    Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn write_file(path: &str, s: &str) -> Result<(), Errno> {
+    let mut f = OpenOptions::new().write(true).open(path).map_err(to_errno)?;
+    f.write_all(s.as_bytes()).map_err(to_errno)
+}
+
+/// _________________________________________________________________________________
+/// Enter a new user namespace and map the real UID/GID to root (0) inside it.
+/// This gives the process root-like privileges *within* the sandbox, without
+/// needing real root permissions on the host.
+///
+/// Acts as a safety net: if we’re already real root outside, skip userns entirely,
+/// since there’s no need to remap anything for mounts or capabilities.
+/// _________________________________________________________________________________
+fn enter_userns_map_root(opts: &ProcletOpts) -> Result<(), Errno> {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+
+    // If running as real root, just don't use a user namespace.
+    if euid == 0 {
+        dbgln!("proclet(debug): skipping userns (already root)");
+        vprintln(3, opts, "skipping user namespace (already real root)");
+        return Ok(());
+    }
+
+    dbgln!("proclet(debug): unshare(CLONE_NEWUSER)");
+    vprintln(2, opts, "unshare(CLONE_NEWUSER) — new user namespace");
+    unshare(CloneFlags::CLONE_NEWUSER)?;
+
+    // On unprivileged paths, kernel requires setgroups=deny before gid_map
+    // Ignore ENOENT/EINVAL here (some kernels/filesystems differ)
+    let _ = write_file("/proc/self/setgroups", "deny\n");
+
+    let uid = euid as u32;
+    let gid = egid as u32;
+
+    write_file("/proc/self/uid_map", &format!("0 {uid} 1\n"))?;
+    write_file("/proc/self/gid_map", &format!("0 {gid} 1\n"))?;
+
+    vprintln(
+        2,
+        opts,
+        &format!("userns uid_map/gid_map configured: 0 <- {}:{}", uid, gid),
+    );
+    Ok(())
+}
+
+// ---- UTS helpers (only compiled when `--features uts`) ----
+#[cfg(feature = "uts")]
+fn maybe_enter_uts_ns_if_needed(hostname: &Option<String>, opts: &ProcletOpts) -> Result<(), Errno> {
+    if hostname.is_some() {
+        dbgln!("proclet(debug): unshare(CLONE_NEWUTS) for hostname");
+        vprintln(2, opts, "unshare(CLONE_NEWUTS) — new UTS namespace");
+        unshare(CloneFlags::CLONE_NEWUTS)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "uts"))]
+fn maybe_enter_uts_ns_if_needed(_hostname: &Option<String>, _opts: &ProcletOpts) -> Result<(), Errno> {
+    Ok(())
+}
+
+/// Preflight: if `--hostname` is requested, ensure we can call sethostname().
+/// Rule of thumb:
+/// - with `--ns user`, non-root callers gain in-ns caps and can set hostname;
+/// - without userns, you must be real root on the host.
+#[cfg(feature = "uts")]
+fn ensure_hostname_possible(use_user: bool) -> Result<(), Errno> {
+    if !use_user {
+        let euid = unsafe { libc::geteuid() };
+        if euid != 0 {
+            return Err(Errno::EPERM);
+        }
+    }
+    Ok(())
 }
 
 /// Exhaustively reap all available children. If `direct_pid` (the payload leader)
 /// has exited, returns its exit code (or 128+signal).
-fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
+fn reap_all(direct_pid: libc::pid_t, opts: &ProcletOpts) -> Result<Option<i32>, Errno> {
     let mut direct_exit: Option<i32> = None;
     loop {
         match waitpid(
@@ -174,11 +208,21 @@ fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
             Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
         ) {
             Ok(WaitStatus::Exited(pid, code)) => {
+                vprintln(
+                    3,
+                    opts,
+                    &format!("waitpid: pid {} exited with code {}", pid, code),
+                );
                 if pid.as_raw() == direct_pid {
                     direct_exit = Some(code);
                 }
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                vprintln(
+                    3,
+                    opts,
+                    &format!("waitpid: pid {} killed by signal {:?}", pid, sig),
+                );
                 if pid.as_raw() == direct_pid {
                     direct_exit = Some(128 + sig as i32);
                 }
@@ -207,9 +251,13 @@ struct TtyGuard {
 }
 
 impl TtyGuard {
-    fn take_for(payload_pgid: libc::pid_t) -> Self {
+    fn take_for(payload_pgid: libc::pid_t, opts: &ProcletOpts) -> Self {
         let fd = std::io::stdin().as_raw_fd();
-        let mut guard = TtyGuard { fd, had_tty: false, prev_fg: None };
+        let mut guard = TtyGuard {
+            fd,
+            had_tty: false,
+            prev_fg: None,
+        };
 
         // Only attempt if stdin is a TTY
         if unsafe { libc::isatty(fd) } != 1 {
@@ -233,6 +281,11 @@ impl TtyGuard {
         if unsafe { libc::tcsetpgrp(fd, payload_pgid) } == 0 {
             guard.had_tty = true;
             dbgln!("proclet(debug): tty foreground -> pgid {}", payload_pgid);
+            vprintln(
+                2,
+                opts,
+                &format!("tty: foreground -> payload pgid {}", payload_pgid),
+            );
         }
 
         // Restore default handlers
@@ -245,11 +298,16 @@ impl TtyGuard {
         guard
     }
 
-    fn restore(&self) {
+    fn restore(&self, opts: &ProcletOpts) {
         if self.had_tty {
             if let Some(pg) = self.prev_fg {
                 let _ = unsafe { libc::tcsetpgrp(self.fd, pg) };
                 dbgln!("proclet(debug): tty foreground restored -> pgid {}", pg);
+                vprintln(
+                    2,
+                    opts,
+                    &format!("tty: foreground restored -> pgid {}", pg),
+                );
             }
         }
     }
@@ -257,8 +315,9 @@ impl TtyGuard {
 
 // === new-root helpers ==============================================================
 
-fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
+fn prepare_new_root(root: &Path, auto_populate: bool, opts: &ProcletOpts) -> Result<(), Errno> {
     // Ensure the root directory exists.
+    vprintln(2, opts, &format!("preparing new_root at {:?}", root));
     std::fs::create_dir_all(root).map_err(to_errno)?;
 
     if !auto_populate {
@@ -288,6 +347,11 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
             host_path,
             inside
         );
+        vprintln(
+            2,
+            opts,
+            &format!("auto-bind core {} -> {:?}", host, inside),
+        );
 
         mount(
             Some(host_path),
@@ -309,9 +373,18 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         return Err(Errno::EINVAL);
     }
 
+    vprintln(
+        2,
+        opts,
+        &format!(
+            "starting sandbox: user={} pid={} mnt={} new_root={:?}",
+            opts.use_user, opts.use_pid, opts.use_mnt, opts.new_root
+        ),
+    );
+
     // 0) User namespace first (enables unprivileged mounts inside)
     if opts.use_user {
-        enter_userns_map_root()?;
+        enter_userns_map_root(opts)?;
     }
 
     // 0.5) UTS namespace if hostname requested (only when built with `uts`)
@@ -319,14 +392,16 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     if opts.hostname.is_some() {
         ensure_hostname_possible(opts.use_user)?;
     }
-    maybe_enter_uts_ns_if_needed(&opts.hostname)?;
+    maybe_enter_uts_ns_if_needed(&opts.hostname, opts)?;
 
     // 1) Isolate mount namespace so our mounts don't leak out.
     if opts.use_mnt {
         dbgln!("proclet(debug): unshare(CLONE_NEWNS)");
+        vprintln(2, opts, "unshare(CLONE_NEWNS) — new mount namespace");
         unshare(CloneFlags::CLONE_NEWNS)?;
 
         dbgln!("proclet(debug): remount / as MS_PRIVATE|MS_REC");
+        vprintln(2, opts, "remount / as MS_PRIVATE|MS_REC");
         mount::<str, str, str, str>(
             None,
             "/",
@@ -337,7 +412,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
         // If a new_root is requested, prepare it (optionally auto-populate).
         if let Some(ref root) = opts.new_root {
-            prepare_new_root(root, opts.new_root_auto)?;
+            prepare_new_root(root, opts.new_root_auto, opts)?;
         }
 
         // Apply user-specified bind mounts before readonly root.
@@ -349,6 +424,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 host,
                 inside,
                 ro
+            );
+            vprintln(
+                2,
+                opts,
+                &format!("bind {:?} -> {:?} (ro={})", host, inside, ro),
             );
             mount(
                 Some(host.as_path()),
@@ -376,6 +456,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     "proclet(debug): remount new_root {:?} read-only (best-effort)",
                     root
                 );
+                vprintln(
+                    2,
+                    opts,
+                    &format!("remount new_root {:?} read-only (best-effort)", root),
+                );
                 let _ = mount::<str, Path, str, str>(
                     None,
                     root,
@@ -385,6 +470,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 );
             } else {
                 dbgln!("proclet(debug): remount / read-only (best-effort)");
+                vprintln(2, opts, "remount / read-only (best-effort)");
                 let _ = mount::<str, str, str, str>(
                     None,
                     "/",
@@ -399,6 +485,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     // 2) Create a new PID namespace (affects future children)
     if opts.use_pid {
         dbgln!("proclet(debug): unshare(CLONE_NEWPID)");
+        vprintln(2, opts, "unshare(CLONE_NEWPID) — new PID namespace");
         unshare(CloneFlags::CLONE_NEWPID)?;
     }
 
@@ -409,30 +496,40 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             #[cfg(feature = "uts")]
             if let Some(h) = &opts.hostname {
                 dbgln!("proclet(debug): sethostname({})", h);
+                vprintln(2, opts, &format!("sethostname({})", h));
                 set_hostname(h)?; // requires UTS ns; userns grants caps in-ns
             }
 
             // If new_root is specified, chroot into it and cd to "/".
             if let Some(ref root) = opts.new_root {
                 dbgln!("proclet(debug): chroot into {:?}", root);
+                vprintln(2, opts, &format!("chroot into {:?}", root));
                 chroot(root)?;
                 chdir(Path::new("/"))?;
             }
 
             if opts.mount_proc && opts.use_mnt {
+                vprintln(2, opts, "mounting fresh /proc");
                 setup_proc()?;
             }
             if let Some(dir) = &opts.chdir {
+                vprintln(2, opts, &format!("chdir to {:?}", dir));
                 chdir(dir)?;
             }
 
             // Put ourselves in a new process group so we can forward signals to the group.
             let _ = unsafe { libc::setpgid(0, 0) };
+            vprintln(3, opts, "setpgid(0,0) in PID1 child");
 
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
                 ForkResult::Child => {
                     // Exec the target (on success, never returns)
+                    vprintln(
+                        2,
+                        opts,
+                        &format!("execvp({}, ...)", argv[0].to_string_lossy()),
+                    );
                     let e = execvp(&argv[0], argv).unwrap_err();
                     log_error(&format!("exec failed: {e}"));
                     std::process::exit(127);
@@ -444,15 +541,21 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     unsafe {
                         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
                     }
+                    vprintln(3, opts, "set PR_SET_CHILD_SUBREAPER = 1");
 
                     // 2) Ensure the payload is its own process group; store its PGID
                     unsafe {
                         libc::setpgid(child.as_raw(), child.as_raw());
                     }
                     let payload_pgid: libc::pid_t = child.as_raw();
+                    vprintln(
+                        3,
+                        opts,
+                        &format!("payload process group set to {}", payload_pgid),
+                    );
 
                     // 2.5) Hand the controlling TTY to the payload's process group
-                    let tty_guard = TtyGuard::take_for(payload_pgid);
+                    let tty_guard = TtyGuard::take_for(payload_pgid, opts);
 
                     // 3) Block signals we want to manage and route them via signalfd
                     let mut mask = SigSet::empty();
@@ -472,9 +575,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     }
                     // Block so default handlers won't run; we will read from signalfd.
                     nix::sys::signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
+                    vprintln(3, opts, "blocked signals and installed signalfd mask");
 
                     // 4) signalfd to consume the blocked signals synchronously
                     let sfd = SignalFd::with_flags(&mask, SfdFlags::SFD_CLOEXEC)?;
+                    vprintln(3, opts, "created signalfd for supervised signals");
 
                     // 5) Main supervision loop: read signals → forward or reap
                     let mut exit_code: Option<i32> = None;
@@ -484,15 +589,33 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                             Ok(Some(si)) => {
                                 let signo = si.ssi_signo as i32;
                                 let sig = Signal::try_from(signo).ok();
+                                vprintln(
+                                    3,
+                                    opts,
+                                    &format!("signalfd: received signo={} (pid={})", signo, si.ssi_pid),
+                                );
 
                                 if matches!(sig, Some(Signal::SIGCHLD)) {
                                     // Reap everything available; capture direct child's exit if any.
-                                    if let Some(code) = reap_all(child.as_raw())? {
+                                    if let Some(code) = reap_all(child.as_raw(), opts)? {
+                                        vprintln(
+                                            2,
+                                            opts,
+                                            &format!("direct child exited with code {}", code),
+                                        );
                                         exit_code = Some(code);
                                     }
                                 } else if let Some(sig) = sig {
                                     // Forward almost everything else to the entire payload process group.
                                     // Negative PGID means: deliver to the process group.
+                                    vprintln(
+                                        3,
+                                        opts,
+                                        &format!(
+                                            "forwarding signal {:?} to process group {}",
+                                            sig, payload_pgid
+                                        ),
+                                    );
                                     unsafe {
                                         libc::kill(-payload_pgid, sig as i32);
                                     }
@@ -500,6 +623,14 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
                                 // If our direct child is done: graceful shutdown of the group
                                 if let Some(code) = exit_code {
+                                    vprintln(
+                                        2,
+                                        opts,
+                                        &format!(
+                                            "payload exited; shutting down process group {}",
+                                            payload_pgid
+                                        ),
+                                    );
                                     // Best-effort TERM then KILL after a short grace
                                     unsafe { libc::kill(-payload_pgid, libc::SIGTERM) };
                                     // ~200ms grace
@@ -511,10 +642,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                     unsafe { libc::kill(-payload_pgid, libc::SIGKILL) };
 
                                     // Drain any stragglers before exiting
-                                    let _ = reap_all(child.as_raw());
+                                    let _ = reap_all(child.as_raw(), opts);
 
                                     // Restore TTY before exit
-                                    tty_guard.restore();
+                                    tty_guard.restore(opts);
 
                                     return Ok(code);
                                 }
@@ -524,8 +655,8 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                             Err(e) => {
                                 log_error(&format!("signalfd error: {e}"));
                                 // Fallback: try reaping; if direct child is gone, exit with its code
-                                if let Some(code) = reap_all(child.as_raw())? {
-                                    tty_guard.restore();
+                                if let Some(code) = reap_all(child.as_raw(), opts)? {
+                                    tty_guard.restore(opts);
                                     return Ok(code);
                                 }
                             }
@@ -536,6 +667,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         }
         ForkResult::Parent { child } => {
             // --- Original process: wait for namespace init (PID1) to finish ---
+            vprintln(
+                3,
+                opts,
+                &format!("outer parent waiting for init pid {}", child.as_raw()),
+            );
             match waitpid(child, None)? {
                 WaitStatus::Exited(_, code) => Ok(code),
                 WaitStatus::Signaled(_, sig, _) => Ok(128 + sig as i32),
@@ -579,7 +715,10 @@ pub fn cstrings(args: &[&str]) -> Vec<CString> {
         match CString::new((*s).as_bytes()) {
             Ok(c) => out.push(c),
             Err(_) => {
-                log_error(&format!("argument contains interior NUL byte: {:?}", s));
+                log_error(&format!(
+                    "argument contains interior NUL byte: {:?}",
+                    s
+                ));
                 std::process::exit(64);
             }
         }
