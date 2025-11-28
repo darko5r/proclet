@@ -23,8 +23,9 @@ use cli::{Cli, Ns};
 use nix::unistd::pipe;
 use proclet::{cstrings, run_pid_mount, ProcletOpts, set_log_fd, set_verbosity};
 use std::{
-    ffi::CString,
+    ffi::{CString, CStr},
     fs::File,
+    path::PathBuf,
     io::{self, IsTerminal, Read, Write},
     os::fd::{FromRawFd, RawFd, IntoRawFd},
     thread,
@@ -185,6 +186,46 @@ fn spawn_logger_thread(read_fd: RawFd) {
 fn main() {
     let cli = Cli::parse();
 
+    // --- Resolve new-root path (explicit or auto) ---
+
+    // If --new-root-auto is set, create /tmp/proclet-XXXXXX with mkdtemp()
+    let auto_root: Option<PathBuf> = if cli.new_root_auto {
+        // build "template\0" buffer for mkdtemp
+        let mut template = b"/tmp/proclet-XXXXXX".to_vec();
+        template.push(0);
+
+        let ptr = template.as_mut_ptr() as *mut libc::c_char;
+        let res = unsafe { libc::mkdtemp(ptr) };
+        if res.is_null() {
+            print_error("failed to create auto new-root under /tmp (mkdtemp failed)");
+            std::process::exit(1);
+        }
+
+        let path_str = unsafe { CStr::from_ptr(res) }
+            .to_string_lossy()
+            .into_owned();
+
+        Some(PathBuf::from(path_str))
+    } else {
+        None
+    };
+
+    // Prefer explicit --new-root if given; otherwise the auto one; otherwise None.
+    let new_root_path: Option<PathBuf> = match (cli.new_root.as_ref(), auto_root.as_ref()) {
+        (Some(explicit), _) => Some(PathBuf::from(explicit)),
+        (None, Some(auto)) => Some(auto.clone()),
+        (None, None) => None,
+    };
+
+    // Safety: --tmpfs-tmp and --new-root-copy require a private root.
+    if (cli.tmpfs_tmp || !cli.new_root_copy.is_empty()) && new_root_path.is_none() {
+        print_error(
+            "--tmpfs-tmp and --new-root-copy require a new root \
+             (use --new-root or --new-root-auto)",
+        );
+        std::process::exit(64); // EX_USAGE
+    }
+
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
         print_error(
@@ -224,7 +265,6 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
-        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
@@ -270,12 +310,12 @@ fn main() {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);
     }
 
-        let opts = ProcletOpts {
+    let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
 
-        // existing toggles
+        // namespace / FS toggles
         use_user,
         use_pid,
         use_mnt,
@@ -283,11 +323,15 @@ fn main() {
         binds: parse_binds(&cli.bind),
 
         // new-root knobs
-        new_root: cli.new_root.as_ref().map(Into::into),
+        new_root: new_root_path,
         new_root_auto: cli.new_root_auto,
 
-        // NEW: copy list + tmpfs flag
-        new_root_copy: cli.new_root_copy.iter().map(Into::into).collect(),
+        // new-root extras
+        new_root_copy: cli
+            .new_root_copy
+            .iter()
+            .map(|s| PathBuf::from(s))
+            .collect(),
         tmpfs_tmp: cli.tmpfs_tmp,
     };
 
