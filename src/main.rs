@@ -21,13 +21,13 @@ mod cli;
 use clap::Parser;
 use cli::{Cli, Ns};
 use nix::unistd::pipe;
-use proclet::{cstrings, run_pid_mount, ProcletOpts, set_log_fd, set_verbosity};
+use proclet::{cstrings, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts};
 use std::{
-    ffi::{CString, CStr},
+    ffi::CStr,
     fs::File,
-    path::PathBuf,
     io::{self, IsTerminal, Read, Write},
-    os::fd::{FromRawFd, RawFd, IntoRawFd},
+    os::fd::{FromRawFd, IntoRawFd, RawFd},
+    path::PathBuf,
     thread,
 };
 
@@ -121,11 +121,7 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
     eprintln!(
         "  {} {}",
         label("root"),
-        format!(
-            "mount_proc={} readonly_root={}",
-            !cli.no_proc,
-            cli.readonly
-        )
+        format!("mount_proc={} readonly_root={}", !cli.no_proc, cli.readonly)
     );
 
     // new-root section
@@ -190,11 +186,10 @@ fn main() {
 
     // If --new-root-auto is set, create /tmp/proclet-XXXXXX with mkdtemp()
     let auto_root: Option<PathBuf> = if cli.new_root_auto {
-        // build "template\0" buffer for mkdtemp
-        let mut template = b"/tmp/proclet-XXXXXX".to_vec();
-        template.push(0);
-
+        // mkdtemp expects a mut char* buffer ending with "XXXXXX\0"
+        let mut template = b"/tmp/proclet-XXXXXX\0".to_vec();
         let ptr = template.as_mut_ptr() as *mut libc::c_char;
+
         let res = unsafe { libc::mkdtemp(ptr) };
         if res.is_null() {
             print_error("failed to create auto new-root under /tmp (mkdtemp failed)");
@@ -211,16 +206,20 @@ fn main() {
     };
 
     // Prefer explicit --new-root if given; otherwise the auto one; otherwise None.
-    let new_root_path: Option<PathBuf> = match (cli.new_root.as_ref(), auto_root.as_ref()) {
-        (Some(explicit), _) => Some(PathBuf::from(explicit)),
-        (None, Some(auto)) => Some(auto.clone()),
-        (None, None) => None,
+    let new_root_path: Option<PathBuf> = if let Some(explicit) = &cli.new_root {
+        Some(PathBuf::from(explicit))
+    } else {
+        auto_root.clone()
     };
 
-    // Safety: --tmpfs-tmp and --new-root-copy require a private root.
-    if (cli.tmpfs_tmp || !cli.new_root_copy.is_empty()) && new_root_path.is_none() {
+    // Safety: --tmpfs-tmp, --new-root-copy, and --copy-bin require a private root.
+    if (cli.tmpfs_tmp
+        || !cli.new_root_copy.is_empty()
+        || !cli.copy_bin.is_empty())
+        && new_root_path.is_none()
+    {
         print_error(
-            "--tmpfs-tmp and --new-root-copy require a new root \
+            "--tmpfs-tmp, --new-root-copy and --copy-bin require a new root \
              (use --new-root or --new-root-auto)",
         );
         std::process::exit(64); // EX_USAGE
@@ -265,11 +264,14 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
+        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
 
-    let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    // Build CString argv
+    let cmd_slices: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
+    let cargs = cstrings(&cmd_slices);
 
     let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
     let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
@@ -330,9 +332,12 @@ fn main() {
         new_root_copy: cli
             .new_root_copy
             .iter()
-            .map(|s| PathBuf::from(s))
+            .map(PathBuf::from)
             .collect(),
         tmpfs_tmp: cli.tmpfs_tmp,
+
+        // copy-bin: binaries + deps into new-root
+        copy_bin: cli.copy_bin.iter().map(PathBuf::from).collect(),
     };
 
     match run_pid_mount(&cargs, &opts) {

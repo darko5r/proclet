@@ -24,20 +24,16 @@ pub enum Ns {
     Pid,
     /// New mount namespace (private mounts + fresh /proc)
     Mnt,
-
-    /// Placeholder for future net namespace (requires building with `--features net`)
+    /// Reserved for future net namespace wiring
     Net,
-
-    #[cfg(feature = "uts")]
-    /// New UTS namespace (hostname/domain isolation) — requires building with `--features uts`
-    Uts,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
 pub struct Cli {
-    /// Namespace(s) to enable (comma-separated). Note: `net` requires build feature `net`,
-    /// and `uts` is only available when built with `--features uts`.
+    /// Namespace(s) to enable (comma-separated).
+    ///
+    /// Default: user,pid,mnt
     #[arg(
         long = "ns",
         value_enum,
@@ -49,9 +45,9 @@ pub struct Cli {
 
     /// Increase verbosity (-v, -vv, -vvv)
     ///
-    /// -v   : summary
-    /// -vv  : runtime steps
-    /// -vvv : deep trace (PID, signal, waitpid, etc.)
+    /// -v   : show a one-line summary of the sandbox
+    /// -vv  : + runtime events
+    /// -vvv : + deep trace
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
@@ -63,10 +59,7 @@ pub struct Cli {
     #[arg(long)]
     pub workdir: Option<String>,
 
-    /// Set hostname inside the sandbox.
-    ///
-    /// Build note: requires compiling with `--features uts`. Without that feature,
-    /// proclet will exit with EX_USAGE if this flag is used.
+    /// Set hostname inside the sandbox (requires `uts` feature at build time)
     #[arg(long)]
     pub hostname: Option<String>,
 
@@ -79,7 +72,6 @@ pub struct Cli {
     pub readonly: bool,
 
     /// New root directory inside the sandbox (bind-mount to /).
-    /// Rough analogue of bubblewrap's --ro-bind /path / --chdir /.
     #[arg(long = "new-root")]
     pub new_root: Option<String>,
 
@@ -87,21 +79,23 @@ pub struct Cli {
     #[arg(long = "new-root-auto")]
     pub new_root_auto: bool,
 
-    /// Copy host paths into the new root (relative to /).
+    /// Copy host files into the new-root (comma-separated).
     ///
     /// Example:
     ///   --new-root-copy /etc/resolv.conf,/etc/hosts
-    ///
-    /// Only meaningful when --new-root or --new-root-auto is used.
     #[arg(long = "new-root-copy", value_delimiter = ',')]
     pub new_root_copy: Vec<String>,
 
-    /// Mount a private tmpfs on /tmp inside the sandbox.
-    ///
-    /// If --new-root/--new-root-auto is used, the tmpfs is created under that root
-    /// (i.e. <new-root>/tmp). Otherwise it mounts directly on /tmp in the sandbox.
+    /// Mount a private tmpfs on /tmp inside the sandbox (or inside new-root if set).
     #[arg(long = "tmpfs-tmp")]
     pub tmpfs_tmp: bool,
+
+    /// Copy a binary and its shared libraries into the new-root (repeatable; comma-separated).
+    ///
+    /// Example:
+    ///   --copy-bin /bin/ls --copy-bin /usr/bin/env
+    #[arg(long = "copy-bin", value_delimiter = ',')]
+    pub copy_bin: Vec<String>,
 
     /// Command to run (use `--` before it)
     #[arg(last = true, required = true)]
