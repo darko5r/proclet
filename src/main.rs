@@ -15,19 +15,46 @@
  */
 
 #![allow(clippy::needless_return)]
-#[cfg(not(feature = "core"))]
-compile_error!(
-    "proclet currently requires the `core` feature. \
-     Build with default features or enable `--features core`."
-);
 
 mod cli;
 
 use clap::Parser;
 use cli::{Cli, Ns};
-use proclet::{cstrings, run_pid_mount, ProcletOpts};
-use std::ffi::CString;
-use std::io::{self, IsTerminal};
+use nix::unistd::pipe;
+use proclet::{cstrings, run_pid_mount, ProcletOpts, set_log_fd, set_verbosity};
+use std::{
+    ffi::CString,
+    fs::File,
+    io::{self, IsTerminal, Read, Write},
+    os::fd::{FromRawFd, RawFd, IntoRawFd},
+    thread,
+};
+
+// ---------- feature gates as booleans ----------
+#[cfg(feature = "net")]
+const FEATURE_NET: bool = true;
+#[cfg(not(feature = "net"))]
+const FEATURE_NET: bool = false;
+
+#[cfg(feature = "uts")]
+const FEATURE_UTS: bool = true;
+#[cfg(not(feature = "uts"))]
+const FEATURE_UTS: bool = false;
+
+// Only define FEATURE_REACTOR in debug builds (it’s only printed in dbg output)
+#[cfg(all(feature = "debug", feature = "reactor"))]
+const FEATURE_REACTOR: bool = true;
+#[cfg(all(feature = "debug", not(feature = "reactor")))]
+const FEATURE_REACTOR: bool = false;
+
+#[cfg(feature = "debug")]
+macro_rules! dbgln {
+    ($($t:tt)*) => { eprintln!($($t)*); }
+}
+#[cfg(not(feature = "debug"))]
+macro_rules! dbgln {
+    ($($t:tt)*) => {};
+}
 
 // ---------- helpers ----------
 
@@ -102,7 +129,7 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     // new-root section
     let root_desc = match (&cli.new_root, cli.new_root_auto) {
-        (Some(path), true) => format!("{} (explicit) + auto-core-dirs", path),
+        (Some(path), true) => format!("{} (explicit) + auto-temp", path),
         (Some(path), false) => path.clone(),
         (None, true) => String::from("auto-temp under /tmp"),
         (None, false) => String::from("<host />"),
@@ -125,31 +152,34 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
     }
 }
 
-// ---------- feature gates as booleans ----------
+/// Background thread that reads from the logging pipe and writes lines to stderr.
+fn spawn_logger_thread(read_fd: RawFd) {
+    // Safety: we take ownership of read_fd inside this thread.
+    let mut file = unsafe { File::from_raw_fd(read_fd) };
 
-#[cfg(feature = "net")]
-const FEATURE_NET: bool = true;
-#[cfg(not(feature = "net"))]
-const FEATURE_NET: bool = false;
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut line_buf = Vec::new();
+        let mut stderr = io::stderr();
 
-#[cfg(feature = "uts")]
-const FEATURE_UTS: bool = true;
-#[cfg(not(feature = "uts"))]
-const FEATURE_UTS: bool = false;
-
-// Only define FEATURE_REACTOR in debug builds (it’s only printed in dbg output)
-#[cfg(all(feature = "debug", feature = "reactor"))]
-const FEATURE_REACTOR: bool = true;
-#[cfg(all(feature = "debug", not(feature = "reactor")))]
-const FEATURE_REACTOR: bool = false;
-
-#[cfg(feature = "debug")]
-macro_rules! dbgln {
-    ($($t:tt)*) => { eprintln!($($t)*); }
-}
-#[cfg(not(feature = "debug"))]
-macro_rules! dbgln {
-    ($($t:tt)*) => {};
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        if b == b'\n' {
+                            let _ = stderr.write_all(&line_buf);
+                            let _ = stderr.write_all(b"\n");
+                            line_buf.clear();
+                        } else {
+                            line_buf.push(b);
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn main() {
@@ -185,6 +215,18 @@ fn main() {
             eprintln!("\tproclet --ns user,pid,mnt -- id");
             std::process::exit(64);
         }
+    }
+
+    // Install global verbosity in the library
+    let verbosity = cli.verbose;
+    set_verbosity(verbosity as u8);
+
+    // If we are in v2+ mode, set up the logging pipe & thread.
+    if verbosity >= 2 {
+        let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
+        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
+        set_log_fd(write_fd.into_raw_fd());
+        spawn_logger_thread(read_fd.into_raw_fd());
     }
 
     let cargs: Vec<CString> = cstrings(&cli.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>());
@@ -223,8 +265,8 @@ fn main() {
         }
     );
 
-    // Verbose summary (Phase 2 feature, level 1)
-    if cli.verbose >= 1 {
+    // v1: human summary
+    if verbosity > 0 {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);
     }
 
@@ -243,9 +285,6 @@ fn main() {
         // new-root knobs
         new_root: cli.new_root.as_ref().map(Into::into),
         new_root_auto: cli.new_root_auto,
-
-        // verbosity for runtime trace
-        verbose: cli.verbose,
     };
 
     match run_pid_mount(&cargs, &opts) {
