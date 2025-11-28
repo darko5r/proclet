@@ -25,19 +25,36 @@ pub enum Ns {
     /// New mount namespace (private mounts + fresh /proc)
     Mnt,
 
-    /// Placeholder for future net namespace (requires building with `--features net`)
+    /// Placeholder for future NET namespace (requires building with `--features net`)
+    ///
+    /// Note: currently parsed and validated, but not yet wired into the engine.
     Net,
 
     #[cfg(feature = "uts")]
-    /// New UTS namespace (hostname/domain isolation) — requires building with `--features uts`
+    /// Placeholder for UTS namespace (hostname isolation).
+    ///
+    /// Currently the actual UTS unshare is triggered by `--hostname`
+    /// when built with `--features uts`. This variant is reserved for
+    /// future explicit control.
     Uts,
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
+#[command(
+    name = "proclet",
+    about = "Proclet — tiny open-source Linux sandbox using namespaces"
+)]
 pub struct Cli {
-    /// Namespace(s) to enable (comma-separated). Note: `net` requires build feature `net`,
-    /// and `uts` is only available when built with `--features uts`.
+    /// Namespace(s) to enable (comma-separated).
+    ///
+    /// Defaults to: user,pid,mnt
+    ///
+    /// Notes:
+    ///   • `net` requires building with the `net` feature (otherwise you get a
+    ///     clear error at runtime).
+    ///   • `uts` is only available when built with `--features uts` and is
+    ///     currently mostly a placeholder — hostname isolation is driven by
+    ///     the `--hostname` flag.
     #[arg(
         long = "ns",
         value_enum,
@@ -47,10 +64,11 @@ pub struct Cli {
     )]
     pub ns: Vec<Ns>,
 
-    /// Increase verbosity (-v, -vv)
+    /// Increase verbosity (-v, -vv, -vvv)
     ///
-    /// -v  : show a one-line summary of the sandbox
-    /// -vv : also show some extra details (reserved for future use)
+    ///   -v   : show sandbox configuration summary only
+    ///   -vv  : add runtime events (namespace setup, /proc mount, exit codes)
+    ///   -vvv : full deep trace (PID1, TTY, signalfd, signal forwarding, etc.)
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
@@ -64,29 +82,57 @@ pub struct Cli {
 
     /// Set hostname inside the sandbox.
     ///
-    /// Build note: requires compiling with `--features uts`. Without that feature,
-    /// proclet will exit with EX_USAGE if this flag is used.
+    /// Build note: requires compiling with `--features uts`. Without that
+    /// feature, proclet will exit with EX_USAGE if this flag is used.
+    ///
+    /// When enabled, Proclet will unshare the UTS namespace and call
+    /// sethostname() inside the sandbox.
     #[arg(long)]
     pub hostname: Option<String>,
 
-    /// Bind-mounts: --bind /host:/inside[:ro] (repeatable; comma-separated also supported)
+    /// Bind-mounts: --bind /host:/inside[:ro]
+    ///
+    /// You can repeat this flag, or pass comma-separated specs:
+    ///   --bind /etc/resolv.conf:/etc/resolv.conf,~/src:/src:ro
     #[arg(long, value_delimiter = ',')]
     pub bind: Vec<String>,
 
-    /// Make root filesystem read-only (remount / as MS_RDONLY)
+    /// Make root filesystem read-only (remount / or new-root as MS_RDONLY)
     #[arg(long)]
     pub readonly: bool,
 
     /// New root directory inside the sandbox (bind-mount to /).
-    /// Rough analogue of bubblewrap's --ro-bind /path / --chdir /.
+    ///
+    /// Rough analogue of:
+    ///   bubblewrap: --ro-bind /my/root / --chdir /
+    ///
+    /// Example:
+    ///   proclet --ns user,pid,mnt --new-root /tmp/proclet-root -- /bin/bash
     #[arg(long = "new-root")]
     pub new_root: Option<String>,
 
-    /// Automatically create a temporary new-root under /tmp (e.g. /tmp/proclet-XXXXXX).
+    /// Automatically create a temporary new-root under /tmp
+    /// (e.g. /tmp/proclet-XXXXXX) and use it as the sandbox root.
+    ///
+    /// If combined with --new-root, Proclet will:
+    ///   • ensure the directory exists, and
+    ///   • optionally auto-populate it with core dirs when used
+    ///     together with --new-root-auto in the engine.
+    ///
+    /// If used alone (no --new-root), Proclet creates a throwaway
+    /// directory under /tmp and uses that as the rootfs for this run.
     #[arg(long = "new-root-auto")]
     pub new_root_auto: bool,
 
-    /// Command to run (use `--` before it)
+    /// Command to run inside the sandbox (use `--` before it).
+    ///
+    /// Example:
+    ///   proclet --ns user,pid,mnt -- /usr/bin/id
+    ///
+    /// Common mistake (extra `--`):
+    ///   proclet --ns user,pid,mnt -- -- id   # WRONG
+    ///
+    /// Proclet detects `cmd[0] == "--"` and prints a helpful error.
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
 }
