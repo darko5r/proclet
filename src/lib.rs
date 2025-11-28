@@ -218,6 +218,13 @@ pub struct ProcletOpts {
     /// If true, automatically bind core system dirs into new_root:
     /// /usr, /bin, /sbin, /lib, /lib64 (only ones that exist).
     pub new_root_auto: bool,
+
+    /// Host files to copy into `new_root` (paths like `/etc/resolv.conf`).
+    /// These are copied to `<new-root>/<relative-path>`.
+    pub new_root_copy: Vec<PathBuf>,
+
+    /// Whether to mount a private tmpfs on `/tmp` inside the sandbox.
+    pub tmpfs_tmp: bool,
 }
 
 /// Exhaustively reap all available children. If `direct_pid` (the payload leader)
@@ -265,7 +272,11 @@ struct TtyGuard {
 impl TtyGuard {
     fn take_for(payload_pgid: libc::pid_t) -> Self {
         let fd = std::io::stdin().as_raw_fd();
-        let mut guard = TtyGuard { fd, had_tty: false, prev_fg: None };
+        let mut guard = TtyGuard {
+            fd,
+            had_tty: false,
+            prev_fg: None,
+        };
 
         // Only attempt if stdin is a TTY
         if unsafe { libc::isatty(fd) } != 1 {
@@ -353,6 +364,40 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
     Ok(())
 }
 
+fn copy_into_new_root(root: &Path, sources: &[PathBuf]) -> Result<(), Errno> {
+    use std::fs;
+
+    for src in sources {
+        if !src.is_absolute() {
+            // Keep it strict for now; we can relax later if we add custom dest paths.
+            v2!("new-root-copy: path {:?} is not absolute, rejecting", src);
+            return Err(Errno::EINVAL);
+        }
+
+        if !src.exists() {
+            // Best-effort: skip missing files, but log at v2.
+            v2!("new-root-copy: source {:?} does not exist, skipping", src);
+            continue;
+        }
+
+        // Strip leading "/" so "/etc/resolv.conf" -> "etc/resolv.conf"
+        let rel = match src.strip_prefix("/") {
+            Ok(r) => r,
+            Err(_) => src.as_path(),
+        };
+        let dest = root.join(rel);
+
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        v2!("new-root-copy: {:?} -> {:?}", src, dest);
+        fs::copy(src, &dest).map_err(to_errno)?;
+    }
+
+    Ok(())
+}
+
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
 /// Order: USER → (UTS?) → MNT (+new-root) → PID
@@ -395,9 +440,13 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             None,
         )?;
 
-        // If a new_root is requested, prepare it (optionally auto-populate).
+        // If a new_root is requested, prepare it (optionally auto-populate + copy files).
         if let Some(ref root) = opts.new_root {
             prepare_new_root(root, opts.new_root_auto)?;
+
+            if !opts.new_root_copy.is_empty() {
+                copy_into_new_root(root, &opts.new_root_copy)?;
+            }
         }
 
         // Apply user-specified bind mounts before readonly root.
@@ -422,6 +471,29 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     None,
                 )?;
             }
+        }
+
+        // Optional tmpfs on /tmp (inside new_root if present)
+        if opts.tmpfs_tmp {
+            use std::fs;
+            use std::path::PathBuf;
+
+            let target: PathBuf = if let Some(ref root) = opts.new_root {
+                root.join("tmp")
+            } else {
+                PathBuf::from("/tmp")
+            };
+
+            let _ = fs::create_dir_all(&target);
+
+            v2!("mounting tmpfs on {:?}", target);
+            mount::<str, Path, str, str>(
+                Some("tmpfs"),
+                &target,
+                Some("tmpfs"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+                Some("size=512M"),
+            )?;
         }
 
         // Apply readonly_root: if we have a new_root, remount that; otherwise `/`.
@@ -550,11 +622,19 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                     v3!("signalfd: received SIGCHLD (pid={})", si.ssi_pid);
                                     // Reap everything available; capture direct child's exit if any.
                                     if let Some(code) = reap_all(child.as_raw())? {
-                                        v3!("waitpid: pid {} exited with code {}", child, code);
+                                        v3!(
+                                            "waitpid: pid {} exited with code {}",
+                                            child,
+                                            code
+                                        );
                                         exit_code = Some(code);
                                     }
                                 } else if let Some(sig) = sig {
-                                    v3!("forwarding signal {:?} to pgid {}", sig, payload_pgid);
+                                    v3!(
+                                        "forwarding signal {:?} to pgid {}",
+                                        sig,
+                                        payload_pgid
+                                    );
                                     // Forward almost everything else to the entire payload process group.
                                     // Negative PGID means: deliver to the process group.
                                     unsafe {
@@ -572,10 +652,15 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                         tv_sec: 0,
                                         tv_nsec: 200_000_000,
                                     };
-                                    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+                                    unsafe {
+                                        libc::nanosleep(&ts, std::ptr::null_mut());
+                                    }
                                     unsafe { libc::kill(-payload_pgid, libc::SIGKILL) };
 
-                                    v2!("payload exited; shutting down process group {}", payload_pgid);
+                                    v2!(
+                                        "payload exited; shutting down process group {}",
+                                        payload_pgid
+                                    );
 
                                     // Drain any stragglers before exiting
                                     let _ = reap_all(child.as_raw());

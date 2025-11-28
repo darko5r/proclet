@@ -270,7 +270,7 @@ fn main() {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);
     }
 
-    let opts = ProcletOpts {
+        let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
@@ -285,6 +285,10 @@ fn main() {
         // new-root knobs
         new_root: cli.new_root.as_ref().map(Into::into),
         new_root_auto: cli.new_root_auto,
+
+        // NEW: copy list + tmpfs flag
+        new_root_copy: cli.new_root_copy.iter().map(Into::into).collect(),
+        tmpfs_tmp: cli.tmpfs_tmp,
     };
 
     match run_pid_mount(&cargs, &opts) {
