@@ -227,7 +227,7 @@ pub struct ProcletOpts {
     /// Whether to mount a private tmpfs on `/tmp` inside the sandbox.
     pub tmpfs_tmp: bool,
 
-    /// Binaries to copy into new-root with their shared libraries.
+    /// Binaries to copy into new-root (plus their shared library dependencies).
     pub copy_bin: Vec<PathBuf>,
 }
 
@@ -368,114 +368,136 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
     Ok(())
 }
 
-/// Copy a single absolute path from host into `<root>/<relative>`.
-fn copy_single_into_root(root: &Path, src: &Path) -> Result<(), Errno> {
+fn copy_into_new_root(root: &Path, sources: &[PathBuf]) -> Result<(), Errno> {
+    use std::fs;
+
+    for src in sources {
+        if !src.is_absolute() {
+            // Keep it strict for now; we can relax later if we add custom dest paths.
+            v2!("new-root-copy: path {:?} is not absolute, rejecting", src);
+            return Err(Errno::EINVAL);
+        }
+
+        if !src.exists() {
+            // Best-effort: skip missing files, but log at v2.
+            v2!("new-root-copy: source {:?} does not exist, skipping", src);
+            continue;
+        }
+
+        // Strip leading "/" so "/etc/resolv.conf" -> "etc/resolv.conf"
+        let rel = match src.strip_prefix("/") {
+            Ok(r) => r,
+            Err(_) => src.as_path(),
+        };
+        let dest = root.join(rel);
+
+        if let Some(parent) = dest.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        v2!("new-root-copy: {:?} -> {:?}", src, dest);
+        fs::copy(src, &dest).map_err(to_errno)?;
+    }
+
+    Ok(())
+}
+
+/// Copy one absolute path into `root`, preserving its absolute layout.
+/// Example: src=/usr/bin/ls, root=/tmp/proclet-XXXXXX →
+/// dest=/tmp/proclet-XXXXXX/usr/bin/ls
+fn copy_path_into_root(root: &Path, src: &Path) -> Result<(), Errno> {
     use std::fs;
 
     if !src.is_absolute() {
         return Err(Errno::EINVAL);
     }
     if !src.exists() {
-        v2!("copy: source {:?} does not exist, skipping", src);
+        v2!("copy-bin: source {:?} does not exist, skipping", src);
         return Ok(());
     }
 
-    // Strip leading "/" so "/etc/resolv.conf" -> "etc/resolv.conf"
-    let rel = match src.strip_prefix("/") {
-        Ok(r) => r,
-        Err(_) => src,
-    };
+    let rel = src.strip_prefix("/").unwrap_or(src);
     let dest = root.join(rel);
 
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(to_errno)?;
+        let _ = fs::create_dir_all(parent);
     }
 
-    v2!("copy: {:?} -> {:?}", src, dest);
+    v2!("copy-bin: {:?} -> {:?}", src, dest);
     fs::copy(src, &dest).map_err(to_errno)?;
     Ok(())
 }
 
-fn copy_into_new_root(root: &Path, sources: &[PathBuf]) -> Result<(), Errno> {
-    for src in sources {
-        if !src.is_absolute() {
-            v2!("new-root-copy: path {:?} is not absolute, rejecting", src);
+/// Use `ldd` to discover shared libs for each binary and copy them into new-root.
+fn copy_bins_with_deps(root: &Path, bins: &[PathBuf]) -> Result<(), Errno> {
+
+    for bin in bins {
+        if !bin.is_absolute() {
+            v2!("copy-bin: path {:?} is not absolute, rejecting", bin);
             return Err(Errno::EINVAL);
         }
-        copy_single_into_root(root, src)?;
-    }
-    Ok(())
-}
 
-/// Copy a binary *and* its shared libraries into the new-root.
-///
-/// Implementation: uses `ldd` as a first simple, pragmatic solution.
-fn copy_bin_and_deps(root: &Path, bin: &Path) -> Result<(), Errno> {
-    if !bin.is_absolute() {
-        v2!("copy-bin: path {:?} is not absolute, rejecting", bin);
-        return Err(Errno::EINVAL);
-    }
-    if !bin.exists() {
-        v2!("copy-bin: binary {:?} does not exist on host", bin);
-        return Err(Errno::ENOENT);
-    }
-
-    // 1) Copy the binary itself
-    copy_single_into_root(root, bin)?;
-
-    // 2) Ask ldd about its dependencies
-    let output = Command::new("ldd")
-        .arg(bin)
-        .output()
-        .map_err(to_errno)?;
-
-    if !output.status.success() {
-        v2!(
-            "copy-bin: `ldd` failed for {:?} (status={:?}), continuing without deps",
-            bin,
-            output.status
-        );
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+        if !bin.exists() {
+            v2!("copy-bin: {:?} does not exist, skipping", bin);
             continue;
         }
 
-        // Skip linux-vdso and similar virtual entries
-        if line.starts_with("linux-vdso") {
-            continue;
-        }
+        // 1) Copy the binary itself.
+        copy_path_into_root(root, bin)?;
 
-        // Patterns we handle:
-        //   "libc.so.6 => /usr/lib/libc.so.6 (0x...)"
-        //   "/lib64/ld-linux-x86-64.so.2 (0x...)"
-        let path_str_opt = if let Some(idx) = line.find("=>") {
-            let after = line[idx + 2..].trim();
-            if after.starts_with("not found") {
-                None
-            } else {
-                after.split_whitespace().next()
+        // 2) Ask ldd about its dependencies.
+        let output = match Command::new("ldd").arg(bin).output() {
+            Ok(o) => o,
+            Err(e) => {
+                v2!("copy-bin: failed to run ldd on {:?}: {}", bin, e);
+                continue;
             }
-        } else if line.starts_with('/') {
-            line.split_whitespace().next()
-        } else {
-            None
         };
 
-        if let Some(p) = path_str_opt {
-            let lib_path = Path::new(p);
-            if lib_path.exists() {
-                copy_single_into_root(root, lib_path)?;
-            } else {
-                v2!(
-                    "copy-bin: dep {:?} from ldd output does not exist on host, skipping",
-                    lib_path
-                );
+        if !output.status.success() {
+            v2!("copy-bin: ldd {:?} returned non-zero, skipping libs", bin);
+            continue;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // Typical patterns:
+            //   linux-vdso.so.1 (0x0000...)
+            //   libm.so.6 => /usr/lib/libm.so.6 (0x0000...)
+            //   /lib64/ld-linux-x86-64.so.2 (0x0000...)
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+
+            // Look for the first token that looks like an absolute path.
+            let mut candidate: Option<&str> = None;
+            for &p in &parts {
+                if p.starts_with('/') {
+                    // Strip trailing ':' if any.
+                    let cleaned = p.trim_end_matches(':');
+                    candidate = Some(cleaned);
+                    break;
+                }
+            }
+
+            if let Some(path_str) = candidate {
+                let lib_path = PathBuf::from(path_str);
+                if lib_path.exists() {
+                    copy_path_into_root(root, &lib_path)?;
+                } else {
+                    v3!("copy-bin: ldd reported {:?} but it does not exist, skipping", lib_path);
+                }
+            }
+        }
+
+        // Also ensure the dynamic linker itself is present if ldd reported it
+        // (usually handled by the parsing above).
+        let ld_candidates = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux.so.2"];
+        for ld in ld_candidates {
+            let p = Path::new(ld);
+            if p.exists() {
+                let _ = copy_path_into_root(root, p);
             }
         }
     }
@@ -525,7 +547,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             None,
         )?;
 
-        // If a new_root is requested, prepare it (optionally auto-populate + copy files/bins).
+        // If a new_root is requested, prepare it (optionally auto-populate + copy files + copy-bin).
         if let Some(ref root) = opts.new_root {
             prepare_new_root(root, opts.new_root_auto)?;
 
@@ -534,9 +556,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             }
 
             if !opts.copy_bin.is_empty() {
-                for bin in &opts.copy_bin {
-                    copy_bin_and_deps(root, bin)?;
-                }
+                copy_bins_with_deps(root, &opts.copy_bin)?;
             }
         }
 
