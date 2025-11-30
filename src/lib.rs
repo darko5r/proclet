@@ -220,6 +220,10 @@ pub struct ProcletOpts {
     /// /usr, /bin, /sbin, /lib, /lib64 (only ones that exist).
     pub new_root_auto: bool,
 
+    /// If true, build a minimal rootfs skeleton instead of auto-binding core dirs.
+    /// Mutually exclusive *conceptually* with "fat" auto-root semantics.
+    pub minimal_rootfs: bool,
+
     /// Host files to copy into `new_root` (paths like `/etc/resolv.conf`).
     /// These are copied to `<new-root>/<relative-path>`.
     pub new_root_copy: Vec<PathBuf>,
@@ -368,6 +372,76 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Build a "thin" / minimal rootfs skeleton at `root`:
+/// - Ensures root exists
+/// - Creates basic dirs: /bin, /usr/bin, /dev, /tmp, /etc
+/// - Binds a minimal set of device nodes from host: /dev/null, /dev/zero, /dev/tty
+fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
+    use std::fs;
+
+    v3!("building minimal rootfs skeleton at {:?}", root);
+
+    fs::create_dir_all(root).map_err(to_errno)?;
+
+    // Basic directory skeleton
+    const DIRS: &[&str] = &["bin", "usr/bin", "dev", "tmp", "etc"];
+    for d in DIRS {
+        let path = root.join(d);
+        if let Err(e) = fs::create_dir_all(&path) {
+            v3!("minimal-rootfs: failed to create {:?}: {}", path, e);
+            return Err(to_errno(e));
+        }
+    }
+
+    // Bind minimal /dev nodes from the host
+    const DEV_NODES: &[&str] = &["null", "zero", "tty"];
+    for dev in DEV_NODES {
+        let host = Path::new("/dev").join(dev);
+        if !host.exists() {
+            v3!(
+                "minimal-rootfs: host device {:?} does not exist, skipping",
+                host
+            );
+            continue;
+        }
+
+        let inside = root.join("dev").join(dev);
+        if let Some(parent) = inside.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        // Create a placeholder file so the bind mount has a valid target
+        if !inside.exists() {
+            match fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&inside)
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    v3!(
+                        "minimal-rootfs: failed to create device placeholder {:?}: {}",
+                        inside,
+                        e
+                    );
+                    return Err(to_errno(e));
+                }
+            }
+        }
+
+        v3!("minimal-rootfs: bind {:?} -> {:?}", host, inside);
+        mount(
+            Some(&host),
+            &inside,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn copy_into_new_root(root: &Path, sources: &[PathBuf]) -> Result<(), Errno> {
     use std::fs;
 
@@ -430,7 +504,6 @@ fn copy_path_into_root(root: &Path, src: &Path) -> Result<(), Errno> {
 
 /// Use `ldd` to discover shared libs for each binary and copy them into new-root.
 fn copy_bins_with_deps(root: &Path, bins: &[PathBuf]) -> Result<(), Errno> {
-
     for bin in bins {
         if !bin.is_absolute() {
             v2!("copy-bin: path {:?} is not absolute, rejecting", bin);
@@ -486,7 +559,10 @@ fn copy_bins_with_deps(root: &Path, bins: &[PathBuf]) -> Result<(), Errno> {
                 if lib_path.exists() {
                     copy_path_into_root(root, &lib_path)?;
                 } else {
-                    v3!("copy-bin: ldd reported {:?} but it does not exist, skipping", lib_path);
+                    v3!(
+                        "copy-bin: ldd reported {:?} but it does not exist, skipping",
+                        lib_path
+                    );
                 }
             }
         }
@@ -514,11 +590,12 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 
     v2!(
-        "starting sandbox: user={} pid={} mnt={} new_root={:?}",
+        "starting sandbox: user={} pid={} mnt={} new_root={:?} minimal_rootfs={}",
         opts.use_user,
         opts.use_pid,
         opts.use_mnt,
-        opts.new_root
+        opts.new_root,
+        opts.minimal_rootfs
     );
 
     // 0) User namespace first (enables unprivileged mounts inside)
@@ -547,9 +624,15 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             None,
         )?;
 
-        // If a new_root is requested, prepare it (optionally auto-populate + copy files + copy-bin).
+        // If a new_root is requested, prepare it:
+        //   - minimal_rootfs: build skeleton + /dev binds
+        //   - otherwise: optional auto-populate (/usr, /bin, ...)
         if let Some(ref root) = opts.new_root {
-            prepare_new_root(root, opts.new_root_auto)?;
+            if opts.minimal_rootfs {
+                build_minimal_rootfs(root)?;
+            } else {
+                prepare_new_root(root, opts.new_root_auto)?;
+            }
 
             if !opts.new_root_copy.is_empty() {
                 copy_into_new_root(root, &opts.new_root_copy)?;

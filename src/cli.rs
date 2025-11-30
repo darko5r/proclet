@@ -51,6 +51,12 @@ pub struct Cli {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
+    /// Create a minimal rootfs skeleton instead of auto-binding /usr, /bin, etc.
+    ///
+    /// Requires a new root (via --new-root or --new-root-auto).
+    #[arg(long = "minimal-rootfs")]
+    pub minimal_rootfs: bool,
+
     /// Do NOT mount a fresh /proc (only valid if Mnt is enabled)
     #[arg(long)]
     pub no_proc: bool,

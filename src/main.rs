@@ -96,10 +96,9 @@ fn print_info(msg: &str) {
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
     let use_color = stderr_is_terminal();
 
-    // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
+            format!("\x1b[36m{}:\x1b[0m", s)
         } else {
             format!("{}:", s)
         }
@@ -125,12 +124,17 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
     );
 
     // new-root section
-    let root_desc = match (&cli.new_root, cli.new_root_auto) {
+    let mut root_desc = match (&cli.new_root, cli.new_root_auto) {
         (Some(path), true) => format!("{} (explicit) + auto-temp", path),
         (Some(path), false) => path.clone(),
         (None, true) => String::from("auto-temp under /tmp"),
         (None, false) => String::from("<host />"),
     };
+
+    if cli.minimal_rootfs {
+        root_desc.push_str(" [minimal-rootfs]");
+    }
+
     eprintln!("  {} {}", label("new-root"), root_desc);
 
     // workdir / hostname
@@ -212,14 +216,15 @@ fn main() {
         auto_root.clone()
     };
 
-    // Safety: --tmpfs-tmp, --new-root-copy, and --copy-bin require a private root.
+    // Safety: these flags require a private rootfs.
     if (cli.tmpfs_tmp
         || !cli.new_root_copy.is_empty()
-        || !cli.copy_bin.is_empty())
+        || !cli.copy_bin.is_empty()
+        || cli.minimal_rootfs)
         && new_root_path.is_none()
     {
         print_error(
-            "--tmpfs-tmp, --new-root-copy and --copy-bin require a new root \
+            "--tmpfs-tmp, --new-root-copy, --copy-bin and --minimal-rootfs require a new root \
              (use --new-root or --new-root-auto)",
         );
         std::process::exit(64); // EX_USAGE
@@ -264,7 +269,6 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
-        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
@@ -328,12 +332,11 @@ fn main() {
         new_root: new_root_path,
         new_root_auto: cli.new_root_auto,
 
+        // minimal rootfs
+        minimal_rootfs: cli.minimal_rootfs,
+
         // new-root extras
-        new_root_copy: cli
-            .new_root_copy
-            .iter()
-            .map(PathBuf::from)
-            .collect(),
+        new_root_copy: cli.new_root_copy.iter().map(PathBuf::from).collect(),
         tmpfs_tmp: cli.tmpfs_tmp,
 
         // copy-bin: binaries + deps into new-root
