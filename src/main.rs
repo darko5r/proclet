@@ -73,6 +73,25 @@ fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, boo
         .collect()
 }
 
+fn parse_env_vars(vars: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for spec in vars {
+        if let Some((k, v)) = spec.split_once('=') {
+            if k.is_empty() {
+                return Err(format!("invalid --env '{}': empty key", spec));
+            }
+            // Very basic check; NULs are impossible in Rust strings anyway.
+            out.push((k.to_string(), v.to_string()));
+        } else {
+            return Err(format!(
+                "invalid --env '{}': expected KEY=VALUE",
+                spec
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
@@ -96,9 +115,10 @@ fn print_info(msg: &str) {
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
     let use_color = stderr_is_terminal();
 
+    // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            format!("\x1b[36m{}:\x1b[0m", s)
+            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
         } else {
             format!("{}:", s)
         }
@@ -150,6 +170,18 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
             eprintln!("    {b}");
         }
         eprintln!("  ]");
+    }
+
+    // Env summary (just a hint, not full dump)
+    if cli.env.is_empty() && !cli.clear_env {
+        eprintln!("  {} inherit (default)", label("env"));
+    } else {
+        eprintln!(
+            "  {} clear_env={} overrides={}",
+            label("env"),
+            cli.clear_env,
+            cli.env.len()
+        );
     }
 }
 
@@ -230,6 +262,15 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
+    // Parse env vars early so we can fail with a clear message.
+    let env_pairs = match parse_env_vars(&cli.env) {
+        Ok(p) => p,
+        Err(msg) => {
+            print_error(&msg);
+            std::process::exit(64);
+        }
+    };
+
     // --- Validate feature-dependent flags up front ---
     if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
         print_error(
@@ -269,6 +310,7 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
+        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
@@ -289,7 +331,7 @@ fn main() {
 
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}{}",
         use_user,
         use_pid,
         use_mnt,
@@ -299,6 +341,8 @@ fn main() {
         cli.workdir,
         cli.hostname,
         cli.bind,
+        cli.clear_env,
+        env_pairs.len(),
         {
             #[cfg(feature = "debug")]
             {
@@ -332,8 +376,12 @@ fn main() {
         new_root: new_root_path,
         new_root_auto: cli.new_root_auto,
 
-        // minimal rootfs
+        // minimal rootfs flag
         minimal_rootfs: cli.minimal_rootfs,
+
+        // env control
+        clear_env: cli.clear_env,
+        env: env_pairs,
 
         // new-root extras
         new_root_copy: cli.new_root_copy.iter().map(PathBuf::from).collect(),

@@ -224,6 +224,13 @@ pub struct ProcletOpts {
     /// Mutually exclusive *conceptually* with "fat" auto-root semantics.
     pub minimal_rootfs: bool,
 
+    /// Clear the environment inside the sandbox before applying `env`.
+    pub clear_env: bool,
+
+    /// Environment variables to set/override inside the sandbox.
+    /// If `clear_env` is false, these overlay the inherited env.
+    pub env: Vec<(String, String)>,
+
     /// Host files to copy into `new_root` (paths like `/etc/resolv.conf`).
     /// These are copied to `<new-root>/<relative-path>`.
     pub new_root_copy: Vec<PathBuf>,
@@ -377,7 +384,7 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
 /// - Creates basic dirs: /bin, /usr/bin, /dev, /tmp, /etc
 /// - Binds a minimal set of device nodes from host: /dev/null, /dev/zero, /dev/tty
 fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
-    use std::fs;
+    use std::fs::{self, File};
 
     v3!("building minimal rootfs skeleton at {:?}", root);
 
@@ -387,10 +394,7 @@ fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
     const DIRS: &[&str] = &["bin", "usr/bin", "dev", "tmp", "etc"];
     for d in DIRS {
         let path = root.join(d);
-        if let Err(e) = fs::create_dir_all(&path) {
-            v3!("minimal-rootfs: failed to create {:?}: {}", path, e);
-            return Err(to_errno(e));
-        }
+        fs::create_dir_all(&path).map_err(to_errno)?;
     }
 
     // Bind minimal /dev nodes from the host
@@ -406,27 +410,15 @@ fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
         }
 
         let inside = root.join("dev").join(dev);
+
         if let Some(parent) = inside.parent() {
-            let _ = fs::create_dir_all(parent);
+            fs::create_dir_all(parent).map_err(to_errno)?;
         }
 
-        // Create a placeholder file so the bind mount has a valid target
+        // For a bind mount of a *file*, the target must already exist.
         if !inside.exists() {
-            match fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&inside)
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    v3!(
-                        "minimal-rootfs: failed to create device placeholder {:?}: {}",
-                        inside,
-                        e
-                    );
-                    return Err(to_errno(e));
-                }
-            }
+            v3!("minimal-rootfs: creating placeholder device file {:?}", inside);
+            File::create(&inside).map_err(to_errno)?;
         }
 
         v3!("minimal-rootfs: bind {:?} -> {:?}", host, inside);
@@ -581,6 +573,37 @@ fn copy_bins_with_deps(root: &Path, bins: &[PathBuf]) -> Result<(), Errno> {
     Ok(())
 }
 
+/// Apply environment policy from ProcletOpts:
+/// - If `clear_env` is true, call clearenv()
+/// - Then set each (key, value) pair via setenv()
+fn apply_env(opts: &ProcletOpts) -> Result<(), Errno> {
+    unsafe {
+        if opts.clear_env {
+            v3!("apply_env: clearenv()");
+            if libc::clearenv() != 0 {
+                return Err(Errno::last());
+            }
+        }
+
+        if !opts.env.is_empty() {
+            v3!(
+                "apply_env: setting {} variable(s) (clear_env={})",
+                opts.env.len(),
+                opts.clear_env
+            );
+        }
+
+        for (key, val) in &opts.env {
+            let k_c = CString::new(key.as_str()).map_err(|_| Errno::EINVAL)?;
+            let v_c = CString::new(val.as_str()).map_err(|_| Errno::EINVAL)?;
+            if libc::setenv(k_c.as_ptr(), v_c.as_ptr(), 1) != 0 {
+                return Err(Errno::last());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
 /// Order: USER → (UTS?) → MNT (+new-root) → PID
@@ -611,18 +634,22 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
 
     // 1) Isolate mount namespace so our mounts don't leak out.
-    if opts.use_mnt {
+        if opts.use_mnt {
         v2!("unshare(CLONE_NEWNS) — new mount namespace");
         unshare(CloneFlags::CLONE_NEWNS)?;
 
-        v2!("remount / as MS_PRIVATE|MS_REC");
-        mount::<str, str, str, str>(
+        v2!("remount / as MS_PRIVATE|MS_REC (best-effort)");
+        if let Err(e) = mount::<str, str, str, str>(
             None,
             "/",
             None,
             MsFlags::MS_REC | MsFlags::MS_PRIVATE,
             None,
-        )?;
+        ) {
+            v2!("remount / as MS_PRIVATE|MS_REC failed: {e}, continuing");
+            // We continue anyway; worst case: mounts may be shared with the host.
+        }
+
 
         // If a new_root is requested, prepare it:
         //   - minimal_rootfs: build skeleton + /dev binds
@@ -754,6 +781,12 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
                 ForkResult::Child => {
+                    // Apply env rules in the innermost child before exec.
+                    if let Err(e) = apply_env(opts) {
+                        log_error(&format!("failed to apply env: {e}"));
+                        std::process::exit(127);
+                    }
+
                     v3!("execvp({:?}, ...)", argv[0]);
                     // Exec the target (on success, never returns)
                     let e = execvp(&argv[0], argv).unwrap_err();

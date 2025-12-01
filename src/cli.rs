@@ -52,8 +52,6 @@ pub struct Cli {
     pub verbose: u8,
 
     /// Create a minimal rootfs skeleton instead of auto-binding /usr, /bin, etc.
-    ///
-    /// Requires a new root (via --new-root or --new-root-auto).
     #[arg(long = "minimal-rootfs")]
     pub minimal_rootfs: bool,
 
@@ -102,6 +100,22 @@ pub struct Cli {
     ///   --copy-bin /bin/ls --copy-bin /usr/bin/env
     #[arg(long = "copy-bin", value_delimiter = ',')]
     pub copy_bin: Vec<String>,
+
+    /// Environment variables to set inside the sandbox (KEY=VALUE).
+    ///
+    /// Repeatable and comma-separated.
+    ///
+    /// Examples:
+    ///   --env PATH=/bin:/usr/bin
+    ///   --env LANG=C,LC_ALL=C
+    #[arg(long = "env", value_delimiter = ',')]
+    pub env: Vec<String>,
+
+    /// Clear the environment inside the sandbox before applying --env.
+    ///
+    /// Default: inherit host environment.
+    #[arg(long = "clear-env")]
+    pub clear_env: bool,
 
     /// Command to run (use `--` before it)
     #[arg(last = true, required = true)]
