@@ -224,6 +224,12 @@ pub struct ProcletOpts {
     /// Mutually exclusive *conceptually* with "fat" auto-root semantics.
     pub minimal_rootfs: bool,
 
+    /// Overlayfs lowerdir (read-only base). If set, new_root becomes
+    /// the overlay mountpoint, with a writable upperdir/workdir.
+    pub overlay_lower: Option<PathBuf>,
+    pub overlay_upper: Option<PathBuf>,
+    pub overlay_work: Option<PathBuf>,
+
     /// Clear the environment inside the sandbox before applying `env`.
     pub clear_env: bool,
 
@@ -430,6 +436,39 @@ fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
             None::<&str>,
         )?;
     }
+
+    Ok(())
+}
+
+fn mount_overlay(root: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), Errno> {
+    use std::fs;
+
+    v3!(
+        "mount overlay: lower={:?} upper={:?} work={:?} -> {:?}",
+        lower,
+        upper,
+        work,
+        root
+    );
+
+    fs::create_dir_all(root).map_err(to_errno)?;
+    fs::create_dir_all(upper).map_err(to_errno)?;
+    fs::create_dir_all(work).map_err(to_errno)?;
+
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+
+    mount::<str, Path, str, str>(
+        Some("overlay"),
+        root,
+        Some("overlay"),
+        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
+        Some(&opts),
+    )?;
 
     Ok(())
 }
@@ -651,16 +690,33 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         }
 
 
-        // If a new_root is requested, prepare it:
-        //   - minimal_rootfs: build skeleton + /dev binds
-        //   - otherwise: optional auto-populate (/usr, /bin, ...)
-        if let Some(ref root) = opts.new_root {
-            if opts.minimal_rootfs {
-                build_minimal_rootfs(root)?;
+                // If a new_root is requested, prepare it:
+        //   - if overlay_lower is set: mount overlayfs on new_root
+        //   - else: minimal_rootfs OR auto-populated root
+                if let Some(ref root) = opts.new_root {
+            if let (Some(lower), Some(upper), Some(work)) = (
+                opts.overlay_lower.as_ref(),
+                opts.overlay_upper.as_ref(),
+                opts.overlay_work.as_ref(),
+            ) {
+                v3!(
+                    "overlay mode: lower={:?}, upper={:?}, work={:?}, mountpoint={:?}",
+                    lower,
+                    upper,
+                    work,
+                    root
+                );
+                mount_overlay(root, lower, upper, work)?;
             } else {
-                prepare_new_root(root, opts.new_root_auto)?;
+                if opts.minimal_rootfs {
+                    build_minimal_rootfs(root)?;
+                } else {
+                    prepare_new_root(root, opts.new_root_auto)?;
+                }
             }
 
+            // These write *inside* whatever root we ended up with (plain or overlay),
+            // which means writes go into the overlay upperdir when overlay is active.
             if !opts.new_root_copy.is_empty() {
                 copy_into_new_root(root, &opts.new_root_copy)?;
             }

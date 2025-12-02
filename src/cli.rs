@@ -111,6 +111,12 @@ pub struct Cli {
     #[arg(long = "env", value_delimiter = ',')]
     pub env: Vec<String>,
 
+    /// Use overlayfs with this lowerdir as the read-only base.
+    ///
+    /// Requires --new-root or --new-root-auto.
+    #[arg(long = "overlay-lower")]
+    pub overlay_lower: Option<String>,
+
     /// Clear the environment inside the sandbox before applying --env.
     ///
     /// Default: inherit host environment.

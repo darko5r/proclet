@@ -157,6 +157,13 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     eprintln!("  {} {}", label("new-root"), root_desc);
 
+    // overlay summary
+    if let Some(ref lower) = cli.overlay_lower {
+        eprintln!("  {} lower={}", label("overlay"), lower);
+    } else {
+        eprintln!("  {} disabled", label("overlay"));
+    }
+
     // workdir / hostname
     eprintln!("  {} {:?}", label("workdir"), cli.workdir.as_deref());
     eprintln!("  {} {:?}", label("hostname"), cli.hostname);
@@ -252,11 +259,12 @@ fn main() {
     if (cli.tmpfs_tmp
         || !cli.new_root_copy.is_empty()
         || !cli.copy_bin.is_empty()
-        || cli.minimal_rootfs)
+        || cli.minimal_rootfs
+        || cli.overlay_lower.is_some())
         && new_root_path.is_none()
     {
         print_error(
-            "--tmpfs-tmp, --new-root-copy, --copy-bin and --minimal-rootfs require a new root \
+            "--tmpfs-tmp, --new-root-copy, --copy-bin, --minimal-rootfs and --overlay-lower require a new root \
              (use --new-root or --new-root-auto)",
         );
         std::process::exit(64); // EX_USAGE
@@ -310,7 +318,8 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
-        // OwnedFd -> RawFd so the logger in lib.rs sees a plain fd
+
+        // nix 0.29 pipe() returns (OwnedFd, OwnedFd); convert to RawFd.
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
@@ -331,7 +340,7 @@ fn main() {
 
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}{}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}, overlay_lower={:?}, minimal_rootfs={}, tmpfs_tmp={}",
         use_user,
         use_pid,
         use_mnt,
@@ -343,22 +352,37 @@ fn main() {
         cli.bind,
         cli.clear_env,
         env_pairs.len(),
-        {
-            #[cfg(feature = "debug")]
-            {
-                format!(", reactor={}", FEATURE_REACTOR)
-            }
-            #[cfg(not(feature = "debug"))]
-            {
-                String::new()
-            }
-        }
+        cli.overlay_lower,
+        cli.minimal_rootfs,
+        cli.tmpfs_tmp,
     );
 
     // v1: human summary
     if verbosity > 0 {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);
     }
+
+    // ---------- overlayfs wiring ----------
+    //
+    // Policy:
+    // - If --overlay-lower is set, we require a new_root_path (validated above).
+    // - new_root_path is the overlay *mountpoint*.
+    // - upperdir and workdir are created as siblings under new_root:
+    //     upper = <new_root>/.upper
+    //     work  = <new_root>/.work
+    //
+    let (overlay_lower, overlay_upper, overlay_work) = if let Some(lower_str) = &cli.overlay_lower
+    {
+        let root = new_root_path
+            .as_ref()
+            .expect("overlay-lower requires new-root/new-root-auto (validated earlier)");
+        let lower = PathBuf::from(lower_str);
+        let upper = root.join(".upper");
+        let work = root.join(".work");
+        (Some(lower), Some(upper), Some(work))
+    } else {
+        (None, None, None)
+    };
 
     let opts = ProcletOpts {
         mount_proc: !cli.no_proc,
@@ -378,6 +402,11 @@ fn main() {
 
         // minimal rootfs flag
         minimal_rootfs: cli.minimal_rootfs,
+
+        // overlayfs knobs
+        overlay_lower,
+        overlay_upper,
+        overlay_work,
 
         // env control
         clear_env: cli.clear_env,
