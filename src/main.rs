@@ -42,11 +42,9 @@ const FEATURE_UTS: bool = true;
 #[cfg(not(feature = "uts"))]
 const FEATURE_UTS: bool = false;
 
-// Only define FEATURE_REACTOR in debug builds (it’s only printed in dbg output)
-#[cfg(all(feature = "debug", feature = "reactor"))]
-const FEATURE_REACTOR: bool = true;
-#[cfg(all(feature = "debug", not(feature = "reactor")))]
-const FEATURE_REACTOR: bool = false;
+// Only exposed in debug builds; tells us whether the `reactor` feature is compiled in.
+#[cfg(feature = "debug")]
+const FEATURE_REACTOR: bool = cfg!(feature = "reactor");
 
 #[cfg(feature = "debug")]
 macro_rules! dbgln {
@@ -340,7 +338,7 @@ fn main() {
 
     // Optional debug dump (only if built with --features debug)
     dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}, overlay_lower={:?}, minimal_rootfs={}, tmpfs_tmp={}",
+        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}, overlay_lower={:?}, minimal_rootfs={}, tmpfs_tmp={}, reactor={}",
         use_user,
         use_pid,
         use_mnt,
@@ -355,6 +353,7 @@ fn main() {
         cli.overlay_lower,
         cli.minimal_rootfs,
         cli.tmpfs_tmp,
+        FEATURE_REACTOR,
     );
 
     // v1: human summary
