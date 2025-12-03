@@ -83,6 +83,12 @@ pub struct Cli {
     #[arg(long = "new-root-auto")]
     pub new_root_auto: bool,
 
+    /// Automatically delete the auto-created new-root directory after the sandbox exits.
+    ///
+    /// Only applies when using --new-root-auto without an explicit --new-root.
+    #[arg(long = "auto-clean-new-root")]
+    pub auto_clean_new_root: bool,
+
     /// Copy host files into the new-root (comma-separated).
     ///
     /// Example:

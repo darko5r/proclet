@@ -23,12 +23,12 @@ use cli::{Cli, Ns};
 use nix::unistd::pipe;
 use proclet::{cstrings, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts};
 use std::{
-    ffi::CStr,
-    fs::File,
-    io::{self, IsTerminal, Read, Write},
-    os::fd::{FromRawFd, IntoRawFd, RawFd},
-    path::PathBuf,
-    thread,
+ ffi::CStr,
+ fs::File,
+ io::{self, IsTerminal, Read, Write},
+ os::fd::{FromRawFd, IntoRawFd, RawFd},
+ path::PathBuf,
+ thread,
 };
 
 // ---------- feature gates as booleans ----------
@@ -48,382 +48,409 @@ const FEATURE_REACTOR: bool = cfg!(feature = "reactor");
 
 #[cfg(feature = "debug")]
 macro_rules! dbgln {
-    ($($t:tt)*) => { eprintln!($($t)*); }
+ ($($t:tt)*) => { eprintln!($($t)*); }
 }
 #[cfg(not(feature = "debug"))]
 macro_rules! dbgln {
-    ($($t:tt)*) => {};
+ ($($t:tt)*) => {};
 }
 
 // ---------- helpers ----------
 
 fn parse_binds(b: &[String]) -> Vec<(std::path::PathBuf, std::path::PathBuf, bool)> {
-    // Syntax: /host:/inside[:ro]
-    b.iter()
-        .filter_map(|spec| {
-            let parts = spec.split(':').collect::<Vec<_>>();
-            if parts.len() < 2 {
-                return None;
-            }
-            let ro = parts.len() >= 3 && parts[2].eq_ignore_ascii_case("ro");
-            Some((parts[0].into(), parts[1].into(), ro))
-        })
-        .collect()
+ // Syntax: /host:/inside[:ro]
+ b.iter()
+     .filter_map(|spec| {
+         let parts = spec.split(':').collect::<Vec<_>>();
+         if parts.len() < 2 {
+             return None;
+         }
+         let ro = parts.len() >= 3 && parts[2].eq_ignore_ascii_case("ro");
+         Some((parts[0].into(), parts[1].into(), ro))
+     })
+     .collect()
 }
 
 fn parse_env_vars(vars: &[String]) -> Result<Vec<(String, String)>, String> {
-    let mut out = Vec::new();
-    for spec in vars {
-        if let Some((k, v)) = spec.split_once('=') {
-            if k.is_empty() {
-                return Err(format!("invalid --env '{}': empty key", spec));
-            }
-            // Very basic check; NULs are impossible in Rust strings anyway.
-            out.push((k.to_string(), v.to_string()));
-        } else {
-            return Err(format!(
-                "invalid --env '{}': expected KEY=VALUE",
-                spec
-            ));
-        }
-    }
-    Ok(out)
+ let mut out = Vec::new();
+ for spec in vars {
+     if let Some((k, v)) = spec.split_once('=') {
+         if k.is_empty() {
+             return Err(format!("invalid --env '{}': empty key", spec));
+         }
+         // Very basic check; NULs are impossible in Rust strings anyway.
+         out.push((k.to_string(), v.to_string()));
+     } else {
+         return Err(format!(
+             "invalid --env '{}': expected KEY=VALUE",
+             spec
+         ));
+     }
+ }
+ Ok(out)
 }
 
 fn stderr_is_terminal() -> bool {
-    io::stderr().is_terminal()
+ io::stderr().is_terminal()
 }
 
 fn print_error(msg: &str) {
-    if stderr_is_terminal() {
-        eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
-    } else {
-        eprintln!("proclet: {msg}");
-    }
+ if stderr_is_terminal() {
+     eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
+ } else {
+     eprintln!("proclet: {msg}");
+ }
 }
 
 fn print_info(msg: &str) {
-    if stderr_is_terminal() {
-        eprintln!("\x1b[36m{msg}\x1b[0m");
-    } else {
-        eprintln!("{msg}");
-    }
+ if stderr_is_terminal() {
+     eprintln!("\x1b[36m{msg}\x1b[0m");
+ } else {
+     eprintln!("{msg}");
+ }
 }
 
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
-    let use_color = stderr_is_terminal();
+ let use_color = stderr_is_terminal();
 
-    // Colorize labels, but don't pad them or add extra spaces.
-    let label = |s: &str| {
-        if use_color {
-            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
-        } else {
-            format!("{}:", s)
-        }
-    };
+ // Colorize labels, but don't pad them or add extra spaces.
+ let label = |s: &str| {
+     if use_color {
+         format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
+     } else {
+         format!("{}:", s)
+     }
+ };
 
-    print_info("proclet: sandbox configuration");
+ print_info("proclet: sandbox configuration");
 
-    // Namespaces
-    eprintln!(
-        "  {} {}",
-        label("ns"),
-        format!(
-            "user={} pid={} mnt={} net={}",
-            use_user, use_pid, use_mnt, use_net
-        )
-    );
+ // Namespaces
+ eprintln!(
+     "  {} {}",
+     label("ns"),
+     format!(
+         "user={} pid={} mnt={} net={}",
+         use_user, use_pid, use_mnt, use_net
+     )
+ );
 
-    // Root section
-    eprintln!(
-        "  {} {}",
-        label("root"),
-        format!("mount_proc={} readonly_root={}", !cli.no_proc, cli.readonly)
-    );
+ // Root section
+ eprintln!(
+     "  {} {}",
+     label("root"),
+     format!("mount_proc={} readonly_root={}", !cli.no_proc, cli.readonly)
+ );
 
-    // new-root section
-    let mut root_desc = match (&cli.new_root, cli.new_root_auto) {
-        (Some(path), true) => format!("{} (explicit) + auto-temp", path),
-        (Some(path), false) => path.clone(),
-        (None, true) => String::from("auto-temp under /tmp"),
-        (None, false) => String::from("<host />"),
-    };
+ // new-root section
+ let mut root_desc = match (&cli.new_root, cli.new_root_auto) {
+     (Some(path), true) => format!("{} (explicit) + auto-temp", path),
+     (Some(path), false) => path.clone(),
+     (None, true) => String::from("auto-temp under /tmp"),
+     (None, false) => String::from("<host />"),
+ };
 
-    if cli.minimal_rootfs {
-        root_desc.push_str(" [minimal-rootfs]");
-    }
+ if cli.minimal_rootfs {
+     root_desc.push_str(" [minimal-rootfs]");
+ }
 
-    eprintln!("  {} {}", label("new-root"), root_desc);
+ eprintln!("  {} {}", label("new-root"), root_desc);
 
-    // overlay summary
-    if let Some(ref lower) = cli.overlay_lower {
-        eprintln!("  {} lower={}", label("overlay"), lower);
-    } else {
-        eprintln!("  {} disabled", label("overlay"));
-    }
+ // overlay summary
+ if let Some(ref lower) = cli.overlay_lower {
+     eprintln!("  {} lower={}", label("overlay"), lower);
+ } else {
+     eprintln!("  {} disabled", label("overlay"));
+ }
 
-    // workdir / hostname
-    eprintln!("  {} {:?}", label("workdir"), cli.workdir.as_deref());
-    eprintln!("  {} {:?}", label("hostname"), cli.hostname);
+ // workdir / hostname
+ eprintln!("  {} {:?}", label("workdir"), cli.workdir.as_deref());
+ eprintln!("  {} {:?}", label("hostname"), cli.hostname);
 
-    // binds
-    if cli.bind.is_empty() {
-        eprintln!("  {} []", label("binds"));
-    } else {
-        eprintln!("  {} [", label("binds"));
-        for b in &cli.bind {
-            eprintln!("    {b}");
-        }
-        eprintln!("  ]");
-    }
+ // binds
+ if cli.bind.is_empty() {
+     eprintln!("  {} []", label("binds"));
+ } else {
+     eprintln!("  {} [", label("binds"));
+     for b in &cli.bind {
+         eprintln!("    {b}");
+     }
+     eprintln!("  ]");
+ }
 
-    // Env summary (just a hint, not full dump)
-    if cli.env.is_empty() && !cli.clear_env {
-        eprintln!("  {} inherit (default)", label("env"));
-    } else {
-        eprintln!(
-            "  {} clear_env={} overrides={}",
-            label("env"),
-            cli.clear_env,
-            cli.env.len()
-        );
-    }
+ // Env summary (just a hint, not full dump)
+ if cli.env.is_empty() && !cli.clear_env {
+     eprintln!("  {} inherit (default)", label("env"));
+ } else {
+     eprintln!(
+         "  {} clear_env={} overrides={}",
+         label("env"),
+         cli.clear_env,
+         cli.env.len()
+     );
+ }
 }
 
 /// Background thread that reads from the logging pipe and writes lines to stderr.
 fn spawn_logger_thread(read_fd: RawFd) {
-    // Safety: we take ownership of read_fd inside this thread.
-    let mut file = unsafe { File::from_raw_fd(read_fd) };
+ // Safety: we take ownership of read_fd inside this thread.
+ let mut file = unsafe { File::from_raw_fd(read_fd) };
 
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        let mut line_buf = Vec::new();
-        let mut stderr = io::stderr();
+ thread::spawn(move || {
+     let mut buf = [0u8; 4096];
+     let mut line_buf = Vec::new();
+     let mut stderr = io::stderr();
 
-        loop {
-            match file.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    for &b in &buf[..n] {
-                        if b == b'\n' {
-                            let _ = stderr.write_all(&line_buf);
-                            let _ = stderr.write_all(b"\n");
-                            line_buf.clear();
-                        } else {
-                            line_buf.push(b);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
+     loop {
+         match file.read(&mut buf) {
+             Ok(0) => break, // EOF
+             Ok(n) => {
+                 for &b in &buf[..n] {
+                     if b == b'\n' {
+                         let _ = stderr.write_all(&line_buf);
+                         let _ = stderr.write_all(b"\n");
+                         line_buf.clear();
+                     } else {
+                         line_buf.push(b);
+                     }
+                 }
+             }
+             Err(_) => break,
+         }
+     }
+ });
 }
 
 fn main() {
-    let cli = Cli::parse();
+ let cli = Cli::parse();
 
-    // --- Resolve new-root path (explicit or auto) ---
+ // --- Resolve new-root path (explicit or auto) ---
 
-    // If --new-root-auto is set, create /tmp/proclet-XXXXXX with mkdtemp()
-    let auto_root: Option<PathBuf> = if cli.new_root_auto {
-        // mkdtemp expects a mut char* buffer ending with "XXXXXX\0"
-        let mut template = b"/tmp/proclet-XXXXXX\0".to_vec();
-        let ptr = template.as_mut_ptr() as *mut libc::c_char;
+ // Prefer explicit --new-root if given.
+ // Otherwise, if --new-root-auto is set, create /tmp/proclet-XXXXXX with mkdtemp().
+ let (new_root_path, auto_root_for_cleanup): (Option<PathBuf>, Option<PathBuf>) =
+     if let Some(explicit) = &cli.new_root {
+         (Some(PathBuf::from(explicit)), None)
+     } else if cli.new_root_auto {
+         // mkdtemp expects a mut char* buffer ending with "XXXXXX\0"
+         let mut template = b"/tmp/proclet-XXXXXX\0".to_vec();
+         let ptr = template.as_mut_ptr() as *mut libc::c_char;
 
-        let res = unsafe { libc::mkdtemp(ptr) };
-        if res.is_null() {
-            print_error("failed to create auto new-root under /tmp (mkdtemp failed)");
-            std::process::exit(1);
+         let res = unsafe { libc::mkdtemp(ptr) };
+         if res.is_null() {
+             print_error("failed to create auto new-root under /tmp (mkdtemp failed)");
+             std::process::exit(1);
+         }
+
+         let path_str = unsafe { CStr::from_ptr(res) }
+             .to_string_lossy()
+             .into_owned();
+
+         let root = PathBuf::from(path_str);
+         (Some(root.clone()), Some(root))
+     } else {
+         (None, None)
+     };
+
+ // Safety: these flags require a private rootfs.
+ if (cli.tmpfs_tmp
+     || !cli.new_root_copy.is_empty()
+     || !cli.copy_bin.is_empty()
+     || cli.minimal_rootfs
+     || cli.overlay_lower.is_some())
+     && new_root_path.is_none()
+ {
+     print_error(
+         "--tmpfs-tmp, --new-root-copy, --copy-bin, --minimal-rootfs and --overlay-lower require a new root \
+          (use --new-root or --new-root-auto)",
+     );
+     std::process::exit(64); // EX_USAGE
+ }
+
+ // Parse env vars early so we can fail with a clear message.
+ let env_pairs = match parse_env_vars(&cli.env) {
+     Ok(p) => p,
+     Err(msg) => {
+         print_error(&msg);
+         std::process::exit(64);
+     }
+ };
+
+ // --- Validate feature-dependent flags up front ---
+ if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
+     print_error(
+         "this binary was built without the `net` feature (requested --ns net).\n\
+          Rebuild with: cargo build --features net",
+     );
+     std::process::exit(64); // EX_USAGE
+ }
+
+ if cli.hostname.is_some() && !FEATURE_UTS {
+     print_error(
+         "setting hostname requires the `uts` feature (requested --hostname ...).\n\
+          Rebuild with: cargo build --features uts",
+     );
+     std::process::exit(64); // EX_USAGE
+ }
+
+ // Validate command vector (common mistake: extra `--` inside cmd)
+ if let Some(first) = cli.cmd.first() {
+     if first == "--" {
+         print_error("invalid command vector (starts with `--`).");
+         eprintln!("Hint: do NOT pass an extra `--` *inside* the command.");
+         eprintln!();
+         eprintln!("\t# bad");
+         eprintln!("\tproclet --ns user,pid,mnt -- -- id");
+         eprintln!();
+         eprintln!("\t# good");
+         eprintln!("\tproclet --ns user,pid,mnt -- id");
+         std::process::exit(64);
+     }
+ }
+
+ // Install global verbosity in the library
+ let verbosity = cli.verbose;
+ set_verbosity(verbosity as u8);
+
+ // If we are in v2+ mode, set up the logging pipe & thread.
+ if verbosity >= 2 {
+     let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
+
+     // nix 0.29 pipe() returns (OwnedFd, OwnedFd); convert to RawFd.
+     set_log_fd(write_fd.into_raw_fd());
+     spawn_logger_thread(read_fd.into_raw_fd());
+ }
+
+ // Build CString argv
+ let cmd_slices: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
+ let cargs = cstrings(&cmd_slices);
+
+ let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
+ let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
+ let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
+ let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+
+ if !use_pid || !use_mnt {
+     print_error("currently requires ns=pid,mnt (others coming soon).");
+     std::process::exit(64);
+ }
+
+ // Optional debug dump (only if built with --features debug)
+ dbgln!(
+     "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}, overlay_lower={:?}, minimal_rootfs={}, tmpfs_tmp={}, reactor={}",
+     use_user,
+     use_pid,
+     use_mnt,
+     use_net,
+     cli.readonly,
+     cli.no_proc,
+     cli.workdir,
+     cli.hostname,
+     cli.bind,
+     cli.clear_env,
+     env_pairs.len(),
+     cli.overlay_lower,
+     cli.minimal_rootfs,
+     cli.tmpfs_tmp,
+     FEATURE_REACTOR,
+ );
+
+ // v1: human summary
+ if verbosity > 0 {
+     print_summary(&cli, use_user, use_pid, use_mnt, use_net);
+ }
+
+ // ---------- overlayfs wiring ----------
+ //
+ // Policy:
+ // - If --overlay-lower is set, we require a new_root_path (validated above).
+ // - new_root_path is the overlay *mountpoint*.
+ // - upperdir and workdir are created as siblings under new_root:
+ //     upper = <new_root>/.upper
+ //     work  = <new_root>/.work
+ //
+ let (overlay_lower, overlay_upper, overlay_work) = if let Some(lower_str) = &cli.overlay_lower
+ {
+     let root = new_root_path
+         .as_ref()
+         .expect("overlay-lower requires new-root/new-root-auto (validated earlier)");
+     let lower = PathBuf::from(lower_str);
+     let upper = root.join(".upper");
+     let work = root.join(".work");
+     (Some(lower), Some(upper), Some(work))
+ } else {
+     (None, None, None)
+ };
+
+ // Decide whether we will auto-clean the auto-created new-root directory.
+ let cleanup_root: Option<PathBuf> = if cli.auto_clean_new_root {
+     if cli.new_root.is_some() {
+         print_error("--auto-clean-new-root only applies with --new-root-auto (no explicit --new-root).");
+         std::process::exit(64); // EX_USAGE
+     }
+     auto_root_for_cleanup.clone()
+ } else {
+     None
+ };
+
+ let opts = ProcletOpts {
+     mount_proc: !cli.no_proc,
+     hostname: cli.hostname.clone(),
+     chdir: cli.workdir.as_deref().map(Into::into),
+
+     // namespace / FS toggles
+     use_user,
+     use_pid,
+     use_mnt,
+     readonly_root: cli.readonly,
+     binds: parse_binds(&cli.bind),
+
+     // new-root knobs
+     new_root: new_root_path,
+     new_root_auto: cli.new_root_auto,
+
+     // minimal rootfs flag
+     minimal_rootfs: cli.minimal_rootfs,
+
+     // overlayfs knobs
+     overlay_lower,
+     overlay_upper,
+     overlay_work,
+
+     // env control
+     clear_env: cli.clear_env,
+     env: env_pairs,
+
+     // new-root extras
+     new_root_copy: cli.new_root_copy.iter().map(PathBuf::from).collect(),
+     tmpfs_tmp: cli.tmpfs_tmp,
+
+     // copy-bin: binaries + deps into new-root
+     copy_bin: cli.copy_bin.iter().map(PathBuf::from).collect(),
+ };
+
+ let exit_code = match run_pid_mount(&cargs, &opts) {
+     Ok(code) => code,
+     Err(e) => {
+         print_error(&format!("failed to start: {e}"));
+         1
+     }
+ };
+
+ if let Some(root) = cleanup_root {
+    // Best-effort; log only in debug builds.
+    match std::fs::remove_dir_all(&root) {
+        Ok(_) => {
+            dbgln!("auto-clean-new-root: removed {:?}", root);
         }
-
-        let path_str = unsafe { CStr::from_ptr(res) }
-            .to_string_lossy()
-            .into_owned();
-
-        Some(PathBuf::from(path_str))
-    } else {
-        None
-    };
-
-    // Prefer explicit --new-root if given; otherwise the auto one; otherwise None.
-    let new_root_path: Option<PathBuf> = if let Some(explicit) = &cli.new_root {
-        Some(PathBuf::from(explicit))
-    } else {
-        auto_root.clone()
-    };
-
-    // Safety: these flags require a private rootfs.
-    if (cli.tmpfs_tmp
-        || !cli.new_root_copy.is_empty()
-        || !cli.copy_bin.is_empty()
-        || cli.minimal_rootfs
-        || cli.overlay_lower.is_some())
-        && new_root_path.is_none()
-    {
-        print_error(
-            "--tmpfs-tmp, --new-root-copy, --copy-bin, --minimal-rootfs and --overlay-lower require a new root \
-             (use --new-root or --new-root-auto)",
-        );
-        std::process::exit(64); // EX_USAGE
-    }
-
-    // Parse env vars early so we can fail with a clear message.
-    let env_pairs = match parse_env_vars(&cli.env) {
-        Ok(p) => p,
-        Err(msg) => {
-            print_error(&msg);
-            std::process::exit(64);
-        }
-    };
-
-    // --- Validate feature-dependent flags up front ---
-    if cli.ns.iter().any(|n| matches!(n, Ns::Net)) && !FEATURE_NET {
-        print_error(
-            "this binary was built without the `net` feature (requested --ns net).\n\
-             Rebuild with: cargo build --features net",
-        );
-        std::process::exit(64); // EX_USAGE
-    }
-
-    if cli.hostname.is_some() && !FEATURE_UTS {
-        print_error(
-            "setting hostname requires the `uts` feature (requested --hostname ...).\n\
-             Rebuild with: cargo build --features uts",
-        );
-        std::process::exit(64); // EX_USAGE
-    }
-
-    // Validate command vector (common mistake: extra `--` inside cmd)
-    if let Some(first) = cli.cmd.first() {
-        if first == "--" {
-            print_error("invalid command vector (starts with `--`).");
-            eprintln!("Hint: do NOT pass an extra `--` *inside* the command.");
-            eprintln!();
-            eprintln!("\t# bad");
-            eprintln!("\tproclet --ns user,pid,mnt -- -- id");
-            eprintln!();
-            eprintln!("\t# good");
-            eprintln!("\tproclet --ns user,pid,mnt -- id");
-            std::process::exit(64);
+        Err(_e) => {
+            dbgln!(
+                "auto-clean-new-root: failed to remove {:?}: {}",
+                root,
+                _e
+            );
         }
     }
+}
 
-    // Install global verbosity in the library
-    let verbosity = cli.verbose;
-    set_verbosity(verbosity as u8);
-
-    // If we are in v2+ mode, set up the logging pipe & thread.
-    if verbosity >= 2 {
-        let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
-
-        // nix 0.29 pipe() returns (OwnedFd, OwnedFd); convert to RawFd.
-        set_log_fd(write_fd.into_raw_fd());
-        spawn_logger_thread(read_fd.into_raw_fd());
-    }
-
-    // Build CString argv
-    let cmd_slices: Vec<&str> = cli.cmd.iter().map(|s| s.as_str()).collect();
-    let cargs = cstrings(&cmd_slices);
-
-    let use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
-    let use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
-    let use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
-
-    if !use_pid || !use_mnt {
-        print_error("currently requires ns=pid,mnt (others coming soon).");
-        std::process::exit(64);
-    }
-
-    // Optional debug dump (only if built with --features debug)
-    dbgln!(
-        "proclet(debug): ns={{ user:{}, pid:{}, mnt:{}, net:{} }}, readonly_root={}, no_proc={}, workdir={:?}, hostname={:?}, binds={:?}, clear_env={}, env_overrides={}, overlay_lower={:?}, minimal_rootfs={}, tmpfs_tmp={}, reactor={}",
-        use_user,
-        use_pid,
-        use_mnt,
-        use_net,
-        cli.readonly,
-        cli.no_proc,
-        cli.workdir,
-        cli.hostname,
-        cli.bind,
-        cli.clear_env,
-        env_pairs.len(),
-        cli.overlay_lower,
-        cli.minimal_rootfs,
-        cli.tmpfs_tmp,
-        FEATURE_REACTOR,
-    );
-
-    // v1: human summary
-    if verbosity > 0 {
-        print_summary(&cli, use_user, use_pid, use_mnt, use_net);
-    }
-
-    // ---------- overlayfs wiring ----------
-    //
-    // Policy:
-    // - If --overlay-lower is set, we require a new_root_path (validated above).
-    // - new_root_path is the overlay *mountpoint*.
-    // - upperdir and workdir are created as siblings under new_root:
-    //     upper = <new_root>/.upper
-    //     work  = <new_root>/.work
-    //
-    let (overlay_lower, overlay_upper, overlay_work) = if let Some(lower_str) = &cli.overlay_lower
-    {
-        let root = new_root_path
-            .as_ref()
-            .expect("overlay-lower requires new-root/new-root-auto (validated earlier)");
-        let lower = PathBuf::from(lower_str);
-        let upper = root.join(".upper");
-        let work = root.join(".work");
-        (Some(lower), Some(upper), Some(work))
-    } else {
-        (None, None, None)
-    };
-
-    let opts = ProcletOpts {
-        mount_proc: !cli.no_proc,
-        hostname: cli.hostname.clone(),
-        chdir: cli.workdir.as_deref().map(Into::into),
-
-        // namespace / FS toggles
-        use_user,
-        use_pid,
-        use_mnt,
-        readonly_root: cli.readonly,
-        binds: parse_binds(&cli.bind),
-
-        // new-root knobs
-        new_root: new_root_path,
-        new_root_auto: cli.new_root_auto,
-
-        // minimal rootfs flag
-        minimal_rootfs: cli.minimal_rootfs,
-
-        // overlayfs knobs
-        overlay_lower,
-        overlay_upper,
-        overlay_work,
-
-        // env control
-        clear_env: cli.clear_env,
-        env: env_pairs,
-
-        // new-root extras
-        new_root_copy: cli.new_root_copy.iter().map(PathBuf::from).collect(),
-        tmpfs_tmp: cli.tmpfs_tmp,
-
-        // copy-bin: binaries + deps into new-root
-        copy_bin: cli.copy_bin.iter().map(PathBuf::from).collect(),
-    };
-
-    match run_pid_mount(&cargs, &opts) {
-        Ok(code) => std::process::exit(code),
-        Err(e) => {
-            print_error(&format!("failed to start: {e}"));
-            std::process::exit(1);
-        }
-    }
+ std::process::exit(exit_code);
 }
