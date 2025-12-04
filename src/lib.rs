@@ -32,6 +32,7 @@ use nix::{
     sys::{
         signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal},
         signalfd::{SfdFlags, SignalFd},
+        stat::{mknod, makedev, Mode, SFlag},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
     unistd::{chdir, chroot, execvp, fork, ForkResult},
@@ -387,8 +388,9 @@ fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
 
 /// Build a "thin" / minimal rootfs skeleton at `root`:
 /// - Ensures root exists
-/// - Creates basic dirs: /bin, /usr/bin, /dev, /tmp, /etc
-/// - Binds a minimal set of device nodes from host: /dev/null, /dev/zero, /dev/tty
+/// - Creates basic dirs: /bin, /usr/bin, /dev, /tmp, /etc, /proc, /sys, /dev/pts, /run
+/// - Creates /dev/null, /dev/zero, /dev/tty via mknod()
+///   and falls back to bind-mounting host /dev/* if mknod is not permitted.
 fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
     use std::fs::{self, File};
 
@@ -397,44 +399,95 @@ fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
     fs::create_dir_all(root).map_err(to_errno)?;
 
     // Basic directory skeleton
-    const DIRS: &[&str] = &["bin", "usr/bin", "dev", "tmp", "etc"];
+    const DIRS: &[&str] = &[
+        "bin",
+        "usr/bin",
+        "dev",
+        "tmp",
+        "etc",
+        "proc",
+        "sys",
+        "dev/pts",
+        "run",
+    ];
     for d in DIRS {
         let path = root.join(d);
         fs::create_dir_all(&path).map_err(to_errno)?;
     }
 
-    // Bind minimal /dev nodes from the host
-    const DEV_NODES: &[&str] = &["null", "zero", "tty"];
-    for dev in DEV_NODES {
-        let host = Path::new("/dev").join(dev);
-        if !host.exists() {
-            v3!(
-                "minimal-rootfs: host device {:?} does not exist, skipping",
-                host
-            );
-            continue;
+    // === Create minimal /dev nodes (null, zero, tty) ===
+    //
+    // First try mknod() inside the new rootfs. On kernels / configs where
+    // mknod is not permitted in user namespaces, fall back to bind-mounting
+    // the host /dev/<name> into the minimal rootfs.
+    let dev_dir = root.join("dev");
+    let devs: &[(&str, u64, u64)] = &[
+        ("null", 1, 3),
+        ("zero", 1, 5),
+        ("tty", 5, 0),
+    ];
+
+    for (name, maj, min) in devs {
+        let path = dev_dir.join(name);
+
+        // Try mknod first.
+        v3!("minimal-rootfs: attempting mknod for /dev/{} at {:?}", name, path);
+        match mknod(
+            &path,
+            SFlag::S_IFCHR,
+            Mode::from_bits_truncate(0o666),
+            makedev(*maj, *min),
+        ) {
+            Ok(_) => {
+                v3!("minimal-rootfs: mknod /dev/{} succeeded", name);
+            }
+            Err(e) if e == Errno::EPERM || e == Errno::EACCES => {
+                // Fallback: bind-mount host /dev/<name> if it exists.
+                let host = Path::new("/dev").join(name);
+                v3!(
+                    "minimal-rootfs: mknod /dev/{} denied ({:?}), falling back to bind mount from {:?}",
+                    name,
+                    e,
+                    host
+                );
+
+                if !host.exists() {
+                    v3!(
+                        "minimal-rootfs: host device {:?} does not exist, skipping",
+                        host
+                    );
+                    continue;
+                }
+
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(to_errno)?;
+                }
+
+                if !path.exists() {
+                    v3!(
+                        "minimal-rootfs: creating placeholder device file {:?} for bind mount",
+                        path
+                    );
+                    File::create(&path).map_err(to_errno)?;
+                }
+
+                mount(
+                    Some(host.as_path()),
+                    &path,
+                    None::<&str>,
+                    MsFlags::MS_BIND,
+                    None::<&str>,
+                )?;
+            }
+            Err(e) => {
+                v3!(
+                    "minimal-rootfs: mknod /dev/{} failed with unexpected error {:?}",
+                    name,
+                    e
+                );
+                return Err(e);
+            }
         }
-
-        let inside = root.join("dev").join(dev);
-
-        if let Some(parent) = inside.parent() {
-            fs::create_dir_all(parent).map_err(to_errno)?;
-        }
-
-        // For a bind mount of a *file*, the target must already exist.
-        if !inside.exists() {
-            v3!("minimal-rootfs: creating placeholder device file {:?}", inside);
-            File::create(&inside).map_err(to_errno)?;
-        }
-
-        v3!("minimal-rootfs: bind {:?} -> {:?}", host, inside);
-        mount(
-            Some(&host),
-            &inside,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )?;
     }
 
     Ok(())
@@ -673,7 +726,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
 
     // 1) Isolate mount namespace so our mounts don't leak out.
-        if opts.use_mnt {
+    if opts.use_mnt {
         v2!("unshare(CLONE_NEWNS) — new mount namespace");
         unshare(CloneFlags::CLONE_NEWNS)?;
 
@@ -689,11 +742,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             // We continue anyway; worst case: mounts may be shared with the host.
         }
 
-
-                // If a new_root is requested, prepare it:
+        // If a new_root is requested, prepare it:
         //   - if overlay_lower is set: mount overlayfs on new_root
         //   - else: minimal_rootfs OR auto-populated root
-                if let Some(ref root) = opts.new_root {
+        if let Some(ref root) = opts.new_root {
             if let (Some(lower), Some(upper), Some(work)) = (
                 opts.overlay_lower.as_ref(),
                 opts.overlay_upper.as_ref(),
