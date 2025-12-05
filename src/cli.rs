@@ -51,6 +51,16 @@ pub struct Cli {
     #[arg(short, long, action = ArgAction::Count)]
     pub verbose: u8,
 
+    /// Enable HyperRoot lab mode (max power inside sandbox, host-safe).
+    #[arg(long = "cursed")]
+    pub cursed: bool,
+
+    /// Ultra-dangerous: operate directly as host root (no user namespace).
+    ///
+    /// Requires real root; changes may affect the host kernel/filesystem.
+    #[arg(long = "cursed-host")]
+    pub cursed_host: bool,
+
     /// Create a minimal rootfs skeleton instead of auto-binding /usr, /bin, etc.
     #[arg(long = "minimal-rootfs")]
     pub minimal_rootfs: bool,

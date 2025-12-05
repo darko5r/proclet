@@ -247,6 +247,12 @@ pub struct ProcletOpts {
 
     /// Binaries to copy into new-root (plus their shared library dependencies).
     pub copy_bin: Vec<PathBuf>,
+
+    /// HyperRoot lab mode (userns+pid+mnt, host-safe experimental mode).
+    pub cursed: bool,
+
+    /// Host-cursed mode (no userns, acts with host root – dangerous).
+    pub cursed_host: bool,
 }
 
 /// Exhaustively reap all available children. If `direct_pid` (the payload leader)
@@ -705,12 +711,14 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 
     v2!(
-        "starting sandbox: user={} pid={} mnt={} new_root={:?} minimal_rootfs={}",
+        "starting sandbox: user={} pid={} mnt={} new_root={:?} minimal_rootfs={} cursed={} cursed_host={}",
         opts.use_user,
         opts.use_pid,
         opts.use_mnt,
         opts.new_root,
-        opts.minimal_rootfs
+        opts.minimal_rootfs,
+        opts.cursed,
+        opts.cursed_host,
     );
 
     // 0) User namespace first (enables unprivileged mounts inside)
