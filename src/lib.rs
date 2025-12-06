@@ -15,25 +15,33 @@
  */
 
 //! Core sandbox engine
-/// _______________________________________________________________________________________________________________________
+
+/// _____________________________________________________________________________
 /// Compile-time safeguard: this library requires the `core` feature to function.
-/// Acts as a safety net — `core` is mandatory for now. Abort early if someone forgets to enable it.
-/// _______________________________________________________________________________________________________________________
+/// Acts as a safety net — `core` is mandatory for now. Abort early if someone
+/// forgets to enable it.
+/// _____________________________________________________________________________
 #[cfg(not(feature = "core"))]
 compile_error!(
     "proclet currently requires the `core` feature. \
      Build with default features or enable `--features core`."
 );
 
+#[macro_use]
+mod log;
+mod fs;
+mod env;
+mod supervisor;
+pub mod cursed;
+
 use nix::{
     errno::Errno,
     mount::{mount, umount2, MntFlags, MsFlags},
     sched::{unshare, CloneFlags},
     sys::{
-        signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal},
+        signal::{SigSet, SigmaskHow, Signal},
         signalfd::{SfdFlags, SignalFd},
-        stat::{mknod, makedev, Mode, SFlag},
-        wait::{waitpid, WaitPidFlag, WaitStatus},
+        wait::{waitpid, WaitStatus},
     },
     unistd::{chdir, chroot, execvp, fork, ForkResult},
 };
@@ -41,105 +49,37 @@ use nix::{
 use std::{
     ffi::CString,
     fs::OpenOptions,
-    io::{self, IsTerminal, Write},
-    os::fd::{AsRawFd, RawFd},
+    io,
     path::{Path, PathBuf},
-    process::Command,
-    sync::{
-        atomic::{AtomicU8, Ordering},
-        OnceLock,
-    },
 };
 
-// ===== runtime verbosity + logger pipe =========================================
+use crate::env::apply_env;
+use crate::fs::{
+    build_minimal_rootfs, copy_bins_with_deps, copy_into_new_root, mount_overlay, prepare_new_root,
+};
+use crate::supervisor::{reap_all, TtyGuard};
 
-static VERBOSITY: AtomicU8 = AtomicU8::new(0);
-static LOG_FD: OnceLock<RawFd> = OnceLock::new();
-
-/// Set global verbosity (0–3) from main.rs (`-v/-vv/-vvv`).
-pub fn set_verbosity(level: u8) {
-    VERBOSITY.store(level, Ordering::Relaxed);
-}
-
-/// Install the logging write-end fd for v2/v3 logs.
-pub fn set_log_fd(fd: RawFd) {
-    let _ = LOG_FD.set(fd);
-}
-
-fn stderr_is_terminal() -> bool {
-    io::stderr().is_terminal()
-}
-
-/// Internal logging helper for v2/v3.
-///
-/// - Respects global VERBOSITY
-/// - Writes either to the logging pipe (if installed) or directly to stderr.
-/// - Each log line is a single write(2) so it does not interleave.
-pub(crate) fn vlog_impl(level: u8, msg: &str) {
-    if VERBOSITY.load(Ordering::Relaxed) < level {
-        return;
-    }
-
-    let pid = unsafe { libc::getpid() };
-    let line = format!("[v{level}] pid={pid} {msg}\n");
-
-    if let Some(fd) = LOG_FD.get().copied() {
-        let bytes = line.as_bytes();
-        let mut written = 0usize;
-        unsafe {
-            while written < bytes.len() {
-                let ptr = bytes.as_ptr().add(written) as *const libc::c_void;
-                let len = (bytes.len() - written) as libc::size_t;
-                let ret = libc::write(fd, ptr, len);
-                if ret <= 0 {
-                    break;
-                }
-                written += ret as usize;
-            }
-        }
-    } else {
-        let _ = io::stderr().write_all(line.as_bytes());
-    }
-}
-
-macro_rules! v2 {
-    ($($arg:tt)*) => {{
-        crate::vlog_impl(2, &format!($($arg)*));
-    }};
-}
-
-macro_rules! v3 {
-    ($($arg:tt)*) => {{
-        crate::vlog_impl(3, &format!($($arg)*));
-    }};
-}
-
-fn log_error(msg: &str) {
-    if stderr_is_terminal() {
-        eprintln!("\x1b[31mproclet: {msg}\x1b[0m");
-    } else {
-        eprintln!("proclet: {msg}");
-    }
-}
+pub use log::{log_error, set_log_fd, set_verbosity};
 
 #[inline]
-fn to_errno(e: std::io::Error) -> Errno {
+fn to_errno(e: io::Error) -> Errno {
     Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
 }
 
 fn write_file(path: &str, s: &str) -> Result<(), Errno> {
     let mut f = OpenOptions::new().write(true).open(path).map_err(to_errno)?;
+    use std::io::Write;
     f.write_all(s.as_bytes()).map_err(to_errno)
 }
 
-/// _________________________________________________________________________________
+/// _____________________________________________________________________________
 /// Enter a new user namespace and map the real UID/GID to root (0) inside it.
 /// This gives the process root-like privileges *within* the sandbox, without
 /// needing real root permissions on the host.
 ///
-/// Acts as a safety net: if we’re already real root outside, skip userns entirely,
-/// since there’s no need to remap anything for mounts or capabilities.
-/// _________________________________________________________________________________
+/// Safety rule:
+/// - If we’re already real root on the host, we skip userns completely.
+/// _____________________________________________________________________________
 fn enter_userns_map_root() -> Result<(), Errno> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
@@ -197,12 +137,16 @@ fn ensure_hostname_possible(use_user: bool) -> Result<(), Errno> {
 }
 
 /// Runtime options for Proclet.
+///
+/// Populated by `main.rs` before calling `run_pid_mount`.
 #[derive(Debug, Default, Clone)]
 pub struct ProcletOpts {
     /// Remount a fresh `/proc` inside the sandbox. Disable for debugging.
     pub mount_proc: bool,
+
     /// Optional hostname to set inside the (isolated) UTS context (requires feature `uts`).
     pub hostname: Option<String>,
+
     /// Optional working directory to `chdir` into before exec.
     pub chdir: Option<PathBuf>,
 
@@ -210,8 +154,11 @@ pub struct ProcletOpts {
     pub use_user: bool,
     pub use_pid: bool,
     pub use_mnt: bool,
+
     pub readonly_root: bool,
-    pub binds: Vec<(PathBuf, PathBuf, bool)>, // (host, inside, ro?)
+
+    /// Bind mounts: (host_path, inside_path, read_only)
+    pub binds: Vec<(PathBuf, PathBuf, bool)>,
 
     /// Optional new root directory for chroot-like isolation.
     /// If set, proclet will chroot into this path inside the mount namespace.
@@ -248,463 +195,16 @@ pub struct ProcletOpts {
     /// Binaries to copy into new-root (plus their shared library dependencies).
     pub copy_bin: Vec<PathBuf>,
 
-    /// HyperRoot lab mode (userns+pid+mnt, host-safe experimental mode).
+    /// HyperRoot lab mode (host-safe, userns+pid+mnt).
     pub cursed: bool,
 
-    /// Host-cursed mode (no userns, acts with host root – dangerous).
+    /// Host-cursed mode (no userns, real host root).
     pub cursed_host: bool,
-}
-
-/// Exhaustively reap all available children. If `direct_pid` (the payload leader)
-/// has exited, returns its exit code (or 128+signal).
-fn reap_all(direct_pid: libc::pid_t) -> Result<Option<i32>, Errno> {
-    let mut direct_exit: Option<i32> = None;
-    loop {
-        match waitpid(
-            None,
-            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED),
-        ) {
-            Ok(WaitStatus::Exited(pid, code)) => {
-                if pid.as_raw() == direct_pid {
-                    direct_exit = Some(code);
-                }
-            }
-            Ok(WaitStatus::Signaled(pid, sig, _)) => {
-                if pid.as_raw() == direct_pid {
-                    direct_exit = Some(128 + sig as i32);
-                }
-            }
-            Ok(WaitStatus::Stopped(_, _))
-            | Ok(WaitStatus::Continued(_))
-            | Ok(WaitStatus::PtraceEvent(_, _, _))
-            | Ok(WaitStatus::PtraceSyscall(_)) => {
-                // ignore; not relevant for regular supervision
-            }
-            Ok(WaitStatus::StillAlive) => break,
-            Err(Errno::ECHILD) => break,   // nothing left to reap
-            Err(Errno::EINTR) => continue, // interrupted, try again
-            Err(e) => return Err(e),       // propagate any other error
-        }
-    }
-    Ok(direct_exit)
-}
-
-// === TTY foreground control helpers (fix interactive shells) ======================
-
-struct TtyGuard {
-    fd: i32,
-    had_tty: bool,
-    prev_fg: Option<libc::pid_t>,
-}
-
-impl TtyGuard {
-    fn take_for(payload_pgid: libc::pid_t) -> Self {
-        let fd = std::io::stdin().as_raw_fd();
-        let mut guard = TtyGuard {
-            fd,
-            had_tty: false,
-            prev_fg: None,
-        };
-
-        // Only attempt if stdin is a TTY
-        if unsafe { libc::isatty(fd) } != 1 {
-            return guard;
-        }
-
-        // Temporarily ignore TTY stop signals so tcsetpgrp won't stop us
-        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        unsafe {
-            let _ = nix::sys::signal::sigaction(Signal::SIGTTOU, &ignore);
-            let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &ignore);
-        }
-
-        // Save previous foreground pgid (libc versions; no nix term feature needed)
-        let pg = unsafe { libc::tcgetpgrp(fd) };
-        if pg > 0 {
-            guard.prev_fg = Some(pg);
-        }
-
-        // Hand TTY to the payload's process group
-        if unsafe { libc::tcsetpgrp(fd, payload_pgid) } == 0 {
-            guard.had_tty = true;
-            v3!("tty: foreground -> payload pgid {}", payload_pgid);
-        }
-
-        // Restore default handlers
-        let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-        unsafe {
-            let _ = nix::sys::signal::sigaction(Signal::SIGTTOU, &dfl);
-            let _ = nix::sys::signal::sigaction(Signal::SIGTTIN, &dfl);
-        }
-
-        guard
-    }
-
-    fn restore(&self) {
-        if self.had_tty {
-            if let Some(pg) = self.prev_fg {
-                let _ = unsafe { libc::tcsetpgrp(self.fd, pg) };
-                v3!("tty: foreground restored -> pgid {}", pg);
-            }
-        }
-    }
-}
-
-// === new-root helpers ==============================================================
-
-fn prepare_new_root(root: &Path, auto_populate: bool) -> Result<(), Errno> {
-    // Ensure the root directory exists.
-    std::fs::create_dir_all(root).map_err(to_errno)?;
-
-    if !auto_populate {
-        return Ok(());
-    }
-
-    const CORE_DIRS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64"];
-
-    for host in CORE_DIRS {
-        let host_path = Path::new(host);
-        if !host_path.exists() {
-            continue;
-        }
-
-        // Map "/usr" -> root/"usr", "/bin" -> root/"bin", etc.
-        let rel = host.trim_start_matches('/');
-        let inside = root.join(rel);
-
-        if host_path.is_dir() {
-            let _ = std::fs::create_dir_all(&inside);
-        } else if let Some(parent) = inside.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-
-        v3!("auto bind core {:?} -> {:?}", host_path, inside);
-
-        mount(
-            Some(host_path),
-            &inside,
-            None::<&str>,
-            MsFlags::MS_BIND | MsFlags::MS_REC,
-            None::<&str>,
-        )?;
-    }
-
-    Ok(())
-}
-
-/// Build a "thin" / minimal rootfs skeleton at `root`:
-/// - Ensures root exists
-/// - Creates basic dirs: /bin, /usr/bin, /dev, /tmp, /etc, /proc, /sys, /dev/pts, /run
-/// - Creates /dev/null, /dev/zero, /dev/tty via mknod()
-///   and falls back to bind-mounting host /dev/* if mknod is not permitted.
-fn build_minimal_rootfs(root: &Path) -> Result<(), Errno> {
-    use std::fs::{self, File};
-
-    v3!("building minimal rootfs skeleton at {:?}", root);
-
-    fs::create_dir_all(root).map_err(to_errno)?;
-
-    // Basic directory skeleton
-    const DIRS: &[&str] = &[
-        "bin",
-        "usr/bin",
-        "dev",
-        "tmp",
-        "etc",
-        "proc",
-        "sys",
-        "dev/pts",
-        "run",
-    ];
-    for d in DIRS {
-        let path = root.join(d);
-        fs::create_dir_all(&path).map_err(to_errno)?;
-    }
-
-    // === Create minimal /dev nodes (null, zero, tty) ===
-    //
-    // First try mknod() inside the new rootfs. On kernels / configs where
-    // mknod is not permitted in user namespaces, fall back to bind-mounting
-    // the host /dev/<name> into the minimal rootfs.
-    let dev_dir = root.join("dev");
-    let devs: &[(&str, u64, u64)] = &[
-        ("null", 1, 3),
-        ("zero", 1, 5),
-        ("tty", 5, 0),
-    ];
-
-    for (name, maj, min) in devs {
-        let path = dev_dir.join(name);
-
-        // Try mknod first.
-        v3!("minimal-rootfs: attempting mknod for /dev/{} at {:?}", name, path);
-        match mknod(
-            &path,
-            SFlag::S_IFCHR,
-            Mode::from_bits_truncate(0o666),
-            makedev(*maj, *min),
-        ) {
-            Ok(_) => {
-                v3!("minimal-rootfs: mknod /dev/{} succeeded", name);
-            }
-            Err(e) if e == Errno::EPERM || e == Errno::EACCES => {
-                // Fallback: bind-mount host /dev/<name> if it exists.
-                let host = Path::new("/dev").join(name);
-                v3!(
-                    "minimal-rootfs: mknod /dev/{} denied ({:?}), falling back to bind mount from {:?}",
-                    name,
-                    e,
-                    host
-                );
-
-                if !host.exists() {
-                    v3!(
-                        "minimal-rootfs: host device {:?} does not exist, skipping",
-                        host
-                    );
-                    continue;
-                }
-
-                if let Some(parent) = path.parent() {
-                    fs::create_dir_all(parent).map_err(to_errno)?;
-                }
-
-                if !path.exists() {
-                    v3!(
-                        "minimal-rootfs: creating placeholder device file {:?} for bind mount",
-                        path
-                    );
-                    File::create(&path).map_err(to_errno)?;
-                }
-
-                mount(
-                    Some(host.as_path()),
-                    &path,
-                    None::<&str>,
-                    MsFlags::MS_BIND,
-                    None::<&str>,
-                )?;
-            }
-            Err(e) => {
-                v3!(
-                    "minimal-rootfs: mknod /dev/{} failed with unexpected error {:?}",
-                    name,
-                    e
-                );
-                return Err(e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn mount_overlay(root: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), Errno> {
-    use std::fs;
-
-    v3!(
-        "mount overlay: lower={:?} upper={:?} work={:?} -> {:?}",
-        lower,
-        upper,
-        work,
-        root
-    );
-
-    fs::create_dir_all(root).map_err(to_errno)?;
-    fs::create_dir_all(upper).map_err(to_errno)?;
-    fs::create_dir_all(work).map_err(to_errno)?;
-
-    let opts = format!(
-        "lowerdir={},upperdir={},workdir={}",
-        lower.display(),
-        upper.display(),
-        work.display()
-    );
-
-    mount::<str, Path, str, str>(
-        Some("overlay"),
-        root,
-        Some("overlay"),
-        MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
-        Some(&opts),
-    )?;
-
-    Ok(())
-}
-
-fn copy_into_new_root(root: &Path, sources: &[PathBuf]) -> Result<(), Errno> {
-    use std::fs;
-
-    for src in sources {
-        if !src.is_absolute() {
-            // Keep it strict for now; we can relax later if we add custom dest paths.
-            v2!("new-root-copy: path {:?} is not absolute, rejecting", src);
-            return Err(Errno::EINVAL);
-        }
-
-        if !src.exists() {
-            // Best-effort: skip missing files, but log at v2.
-            v2!("new-root-copy: source {:?} does not exist, skipping", src);
-            continue;
-        }
-
-        // Strip leading "/" so "/etc/resolv.conf" -> "etc/resolv.conf"
-        let rel = match src.strip_prefix("/") {
-            Ok(r) => r,
-            Err(_) => src.as_path(),
-        };
-        let dest = root.join(rel);
-
-        if let Some(parent) = dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        v2!("new-root-copy: {:?} -> {:?}", src, dest);
-        fs::copy(src, &dest).map_err(to_errno)?;
-    }
-
-    Ok(())
-}
-
-/// Copy one absolute path into `root`, preserving its absolute layout.
-/// Example: src=/usr/bin/ls, root=/tmp/proclet-XXXXXX →
-/// dest=/tmp/proclet-XXXXXX/usr/bin/ls
-fn copy_path_into_root(root: &Path, src: &Path) -> Result<(), Errno> {
-    use std::fs;
-
-    if !src.is_absolute() {
-        return Err(Errno::EINVAL);
-    }
-    if !src.exists() {
-        v2!("copy-bin: source {:?} does not exist, skipping", src);
-        return Ok(());
-    }
-
-    let rel = src.strip_prefix("/").unwrap_or(src);
-    let dest = root.join(rel);
-
-    if let Some(parent) = dest.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-
-    v2!("copy-bin: {:?} -> {:?}", src, dest);
-    fs::copy(src, &dest).map_err(to_errno)?;
-    Ok(())
-}
-
-/// Use `ldd` to discover shared libs for each binary and copy them into new-root.
-fn copy_bins_with_deps(root: &Path, bins: &[PathBuf]) -> Result<(), Errno> {
-    for bin in bins {
-        if !bin.is_absolute() {
-            v2!("copy-bin: path {:?} is not absolute, rejecting", bin);
-            return Err(Errno::EINVAL);
-        }
-
-        if !bin.exists() {
-            v2!("copy-bin: {:?} does not exist, skipping", bin);
-            continue;
-        }
-
-        // 1) Copy the binary itself.
-        copy_path_into_root(root, bin)?;
-
-        // 2) Ask ldd about its dependencies.
-        let output = match Command::new("ldd").arg(bin).output() {
-            Ok(o) => o,
-            Err(e) => {
-                v2!("copy-bin: failed to run ldd on {:?}: {}", bin, e);
-                continue;
-            }
-        };
-
-        if !output.status.success() {
-            v2!("copy-bin: ldd {:?} returned non-zero, skipping libs", bin);
-            continue;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            // Typical patterns:
-            //   linux-vdso.so.1 (0x0000...)
-            //   libm.so.6 => /usr/lib/libm.so.6 (0x0000...)
-            //   /lib64/ld-linux-x86-64.so.2 (0x0000...)
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            // Look for the first token that looks like an absolute path.
-            let mut candidate: Option<&str> = None;
-            for &p in &parts {
-                if p.starts_with('/') {
-                    // Strip trailing ':' if any.
-                    let cleaned = p.trim_end_matches(':');
-                    candidate = Some(cleaned);
-                    break;
-                }
-            }
-
-            if let Some(path_str) = candidate {
-                let lib_path = PathBuf::from(path_str);
-                if lib_path.exists() {
-                    copy_path_into_root(root, &lib_path)?;
-                } else {
-                    v3!(
-                        "copy-bin: ldd reported {:?} but it does not exist, skipping",
-                        lib_path
-                    );
-                }
-            }
-        }
-
-        // Also ensure the dynamic linker itself is present if ldd reported it
-        // (usually handled by the parsing above).
-        let ld_candidates = ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux.so.2"];
-        for ld in ld_candidates {
-            let p = Path::new(ld);
-            if p.exists() {
-                let _ = copy_path_into_root(root, p);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Apply environment policy from ProcletOpts:
-/// - If `clear_env` is true, call clearenv()
-/// - Then set each (key, value) pair via setenv()
-fn apply_env(opts: &ProcletOpts) -> Result<(), Errno> {
-    unsafe {
-        if opts.clear_env {
-            v3!("apply_env: clearenv()");
-            if libc::clearenv() != 0 {
-                return Err(Errno::last());
-            }
-        }
-
-        if !opts.env.is_empty() {
-            v3!(
-                "apply_env: setting {} variable(s) (clear_env={})",
-                opts.env.len(),
-                opts.clear_env
-            );
-        }
-
-        for (key, val) in &opts.env {
-            let k_c = CString::new(key.as_str()).map_err(|_| Errno::EINVAL)?;
-            let v_c = CString::new(val.as_str()).map_err(|_| Errno::EINVAL)?;
-            if libc::setenv(k_c.as_ptr(), v_c.as_ptr(), 1) != 0 {
-                return Err(Errno::last());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
-/// Order: USER → (UTS?) → MNT (+new-root) → PID
+/// Order: USER → (UTS?) → MNT (+new-root/overlay) → PID
 pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno> {
     if argv.is_empty() {
         return Err(Errno::EINVAL);
@@ -732,6 +232,8 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         ensure_hostname_possible(opts.use_user)?;
     }
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
+
+    // (later we can call cursed::apply_cursed_policies(opts) here if desired)
 
     // 1) Isolate mount namespace so our mounts don't leak out.
     if opts.use_mnt {
@@ -775,14 +277,23 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 }
             }
 
-            // These write *inside* whatever root we ended up with (plain or overlay),
-            // which means writes go into the overlay upperdir when overlay is active.
+            // Copy extra files into the (possibly overlay-backed) root
             if !opts.new_root_copy.is_empty() {
                 copy_into_new_root(root, &opts.new_root_copy)?;
             }
 
+            // copy-bin behaviour:
+            // - minimal_rootfs or overlay: really copy binaries + deps into root
+            // - new-root-auto (fat root with /bin,/usr bind-mounted): skip to avoid clobber
             if !opts.copy_bin.is_empty() {
-                copy_bins_with_deps(root, &opts.copy_bin)?;
+                if opts.minimal_rootfs || opts.overlay_lower.is_some() {
+                    copy_bins_with_deps(root, &opts.copy_bin)?;
+                } else {
+                    v2!(
+                        "copy-bin: new-root-auto already exposes /bin and /usr; \
+                         skipping extra copies to avoid clobbering host binaries"
+                    );
+                }
             }
         }
 
@@ -978,7 +489,6 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                         sig,
                                         payload_pgid
                                     );
-                                    // Forward almost everything else to the entire payload process group.
                                     // Negative PGID means: deliver to the process group.
                                     unsafe {
                                         libc::kill(-payload_pgid, sig as i32);
@@ -1014,7 +524,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                     return Ok(code);
                                 }
                             }
-                            Ok(None) => continue, // nothing to read (blocking fd, so unlikely)
+                            Ok(None) => continue,
                             Err(e) if e == Errno::EINTR => continue,
                             Err(e) => {
                                 log_error(&format!("signalfd error: {e}"));
