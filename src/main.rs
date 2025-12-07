@@ -21,7 +21,7 @@ mod cli;
 use clap::Parser;
 use cli::{Cli, Ns};
 use nix::unistd::pipe;
-use proclet::{cstrings, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts};
+use proclet::{cstrings, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts, cursed};
 use std::{
     ffi::CStr,
     fs::File,
@@ -444,7 +444,7 @@ fn main() {
         None
     };
 
-    let opts = ProcletOpts {
+        let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
@@ -483,6 +483,18 @@ fn main() {
         cursed: cli.cursed,
         cursed_host: cli.cursed_host,
     };
+
+    // ── Apply cursed profiles (mutually exclusive) ──────────────────────────────
+    if cli.cursed && cli.cursed_host {
+        eprintln!("proclet: --cursed and --cursed-host cannot be used together");
+        std::process::exit(2);
+    }
+
+    if cli.cursed {
+        cursed::apply_lab_mode(&mut opts);
+    } else if cli.cursed_host {
+        cursed::apply_host_mode(&mut opts);
+    }
 
     let exit_code = match run_pid_mount(&cargs, &opts) {
         Ok(code) => code,
