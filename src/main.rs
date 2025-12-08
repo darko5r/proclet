@@ -453,6 +453,7 @@ fn main() {
         use_user,
         use_pid,
         use_mnt,
+        use_net,
         readonly_root: cli.readonly,
         binds: parse_binds(&cli.bind),
 

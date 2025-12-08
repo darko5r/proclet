@@ -50,6 +50,7 @@ use std::{
     ffi::CString,
     fs::OpenOptions,
     io,
+    process::Command,
     path::{Path, PathBuf},
 };
 
@@ -154,7 +155,7 @@ pub struct ProcletOpts {
     pub use_user: bool,
     pub use_pid: bool,
     pub use_mnt: bool,
-
+    pub use_net: bool,
     pub readonly_root: bool,
 
     /// Bind mounts: (host_path, inside_path, read_only)
@@ -211,15 +212,16 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 
     v2!(
-        "starting sandbox: user={} pid={} mnt={} new_root={:?} minimal_rootfs={} cursed={} cursed_host={}",
-        opts.use_user,
-        opts.use_pid,
-        opts.use_mnt,
-        opts.new_root,
-        opts.minimal_rootfs,
-        opts.cursed,
-        opts.cursed_host,
-    );
+    "starting sandbox: user={} pid={} mnt={} net={} new_root={:?} minimal_rootfs={} cursed={} cursed_host={}",
+    opts.use_user,
+    opts.use_pid,
+    opts.use_mnt,
+    opts.use_net,
+    opts.new_root,
+    opts.minimal_rootfs,
+    opts.cursed,
+    opts.cursed_host,
+);
 
     // 0) User namespace first (enables unprivileged mounts inside)
     if opts.use_user {
@@ -232,6 +234,28 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         ensure_hostname_possible(opts.use_user)?;
     }
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
+
+        // 0.75) Optional network namespace
+    if opts.use_net {
+        v2!("unshare(CLONE_NEWNET) — new network namespace");
+        unshare(CloneFlags::CLONE_NEWNET)?;
+
+        // Best-effort: bring up loopback so 127.0.0.1 works.
+        // We don't fail the whole sandbox if this doesn't work.
+        match Command::new("ip").args(["link", "set", "lo", "up"]).status() {
+            Ok(status) => {
+                if !status.success() {
+                    v2!(
+                        "warning: `ip link set lo up` exited with status {:?} in netns",
+                        status.code()
+                    );
+                }
+            }
+            Err(e) => {
+                v2!("warning: failed to run `ip link set lo up` in netns: {e}");
+            }
+        }
+    }
 
     // (later we can call cursed::apply_cursed_policies(opts) here if desired)
 
