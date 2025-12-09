@@ -32,6 +32,8 @@ debug = []      # extra logging / diagnostics
 # feature for async/event-driven I/O
 reactor = ["mio"]
 
+full = ["core", "net", "ipc", "uts", "cgroups", "seccomp", "reactor"]
+
 [profile.release]
 opt-level = 3
 lto = "fat" 
