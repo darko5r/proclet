@@ -231,17 +231,12 @@ fn main() {
     let cli = Cli::parse();
 
     // --- Global cursed mode validation ---
-
-    // --cursed and --cursed-host are mutually exclusive.
     if cli.cursed && cli.cursed_host {
         print_error("--cursed and --cursed-host cannot be used together");
         std::process::exit(64); // EX_USAGE
     }
 
     // --- Resolve new-root path (explicit or auto) ---
-
-    // Prefer explicit --new-root if given.
-    // Otherwise, if --new-root-auto is set, create /tmp/proclet-XXXXXX with mkdtemp().
     let (new_root_path, auto_root_for_cleanup): (Option<PathBuf>, Option<PathBuf>) =
         if let Some(explicit) = &cli.new_root {
             (Some(PathBuf::from(explicit)), None)
@@ -343,7 +338,7 @@ fn main() {
     let mut use_user = cli.ns.iter().any(|n| matches!(n, Ns::User));
     let mut use_pid = cli.ns.iter().any(|n| matches!(n, Ns::Pid));
     let mut use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
-    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net)); // reserved for future wiring
+    let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net));
 
     // --- Cursed semantics ---
 
@@ -370,7 +365,9 @@ fn main() {
 
         // Only show the scary banner for interactive use.
         if io::stderr().is_terminal() {
-            eprintln!("\x1b[31mproclet: WARNING: --cursed-host will run with real host root powers.\x1b[0m");
+            eprintln!(
+                "\x1b[31mproclet: WARNING: --cursed-host will run with real host root powers.\x1b[0m"
+            );
             eprintln!("proclet: Changes may permanently affect the host kernel and filesystem.");
             eprintln!("proclet: Press Ctrl+C now to abort, or wait 5 seconds to continue...");
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -410,14 +407,6 @@ fn main() {
     }
 
     // ---------- overlayfs wiring ----------
-    //
-    // Policy:
-    // - If --overlay-lower is set, we require a new_root_path (validated above).
-    // - new_root_path is the overlay *mountpoint*.
-    // - upperdir and workdir are created as siblings under new_root:
-    //     upper = <new_root>/.upper
-    //     work  = <new_root>/.work
-    //
     let (overlay_lower, overlay_upper, overlay_work) =
         if let Some(lower_str) = &cli.overlay_lower {
             let root = new_root_path
@@ -444,7 +433,8 @@ fn main() {
         None
     };
 
-        let mut opts = ProcletOpts {
+    // Build ProcletOpts, now with drop_uid/drop_gid wired from --as-user
+    let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
         chdir: cli.workdir.as_deref().map(Into::into),
@@ -483,14 +473,13 @@ fn main() {
         // cursed modes
         cursed: cli.cursed,
         cursed_host: cli.cursed_host,
+
+        // NEW: privilege drop inside sandbox
+        drop_uid: cli.as_user,
+        drop_gid: cli.as_user, // same UID/GID for now
     };
 
-    // ── Apply cursed profiles (mutually exclusive) ──────────────────────────────
-    if cli.cursed && cli.cursed_host {
-        eprintln!("proclet: --cursed and --cursed-host cannot be used together");
-        std::process::exit(2);
-    }
-
+    // ── Apply cursed profiles (mutually exclusive already checked above) ───────
     if cli.cursed {
         cursed::apply_lab_mode(&mut opts);
     } else if cli.cursed_host {
@@ -511,12 +500,8 @@ fn main() {
             Ok(_) => {
                 dbgln!("auto-clean-new-root: removed {:?}", root);
             }
-            Err(_e) => {
-                dbgln!(
-                    "auto-clean-new-root: failed to remove {:?}: {}",
-                    root,
-                    _e
-                );
+            Err(e) => {
+                dbgln!("auto-clean-new-root: failed to remove {:?}: {}", root, e);
             }
         }
     }

@@ -142,4 +142,9 @@ pub struct Cli {
     /// Command to run (use `--` before it)
     #[arg(last = true, required = true)]
     pub cmd: Vec<String>,
+
+    /// Drop privileges inside the sandbox to this numeric UID (and GID).
+    /// Example: --as-user 1000 to run a GUI app from root as uid 1000.
+    #[arg(long = "as-user", value_name = "UID")]
+    pub as_user: Option<u32>,
 }

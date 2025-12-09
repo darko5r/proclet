@@ -201,6 +201,11 @@ pub struct ProcletOpts {
 
     /// Host-cursed mode (no userns, real host root).
     pub cursed_host: bool,
+
+    /// Drop privileges inside the sandbox to this UID/GID before exec.
+    /// Useful for running GUI apps from root while keeping Chrome's own sandbox.
+    pub drop_uid: Option<u32>,
+    pub drop_gid: Option<u32>,
 }
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
@@ -431,19 +436,51 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
-                ForkResult::Child => {
-                    // Apply env rules in the innermost child before exec.
-                    if let Err(e) = apply_env(opts) {
-                        log_error(&format!("failed to apply env: {e}"));
-                        std::process::exit(127);
-                    }
+    ForkResult::Child => {
+        // --- Innermost payload child (will exec the target) ---
 
-                    v3!("execvp({:?}, ...)", argv[0]);
-                    // Exec the target (on success, never returns)
-                    let e = execvp(&argv[0], argv).unwrap_err();
-                    log_error(&format!("exec failed: {e}"));
-                    std::process::exit(127);
-                }
+        // Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
+        if let Some(uid) = opts.drop_uid {
+            let gid = opts.drop_gid.unwrap_or(uid);
+            v3!("dropping privileges to uid={}, gid={}", uid, gid);
+
+            // Clear supplementary groups first.
+            unsafe {
+                libc::setgroups(0, std::ptr::null());
+            }
+
+            if unsafe { libc::setgid(gid) } != 0 {
+                log_error(&format!(
+                    "setgid({}) failed: {}",
+                    gid,
+                    Errno::last()
+                ));
+                std::process::exit(127);
+            }
+            if unsafe { libc::setuid(uid) } != 0 {
+                log_error(&format!(
+                    "setuid({}) failed: {}",
+                    uid,
+                    Errno::last()
+                ));
+                std::process::exit(127);
+            }
+
+            v3!("privilege drop complete");
+        }
+
+        // Apply env rules in the innermost child before exec.
+        if let Err(e) = apply_env(opts) {
+            log_error(&format!("failed to apply env: {e}"));
+            std::process::exit(127);
+        }
+
+        v3!("execvp({:?}, ...)", argv[0]);
+        // Exec the target (on success, never returns)
+        let e = execvp(&argv[0], argv).unwrap_err();
+        log_error(&format!("exec failed: {e}"));
+        std::process::exit(127);
+    }
                 ForkResult::Parent { child } => {
                     // === subreaper + signalfd + full forward + exhaustive reap ===
 
