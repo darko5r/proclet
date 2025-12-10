@@ -29,8 +29,8 @@ compile_error!(
 
 #[macro_use]
 mod log;
-mod fs;
 mod env;
+mod fs;
 mod supervisor;
 pub mod cursed;
 
@@ -50,8 +50,8 @@ use std::{
     ffi::CString,
     fs::OpenOptions,
     io,
-    process::Command,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::env::apply_env;
@@ -208,6 +208,42 @@ pub struct ProcletOpts {
     pub drop_gid: Option<u32>,
 }
 
+/// Best-effort capability hardening for the payload child.
+///
+/// For now, we:
+/// - iterate over a wide capability range and drop each from the
+///   bounding set (PR_CAPBSET_DROP).
+///
+/// This ensures **future execs** in this process tree can't gain caps
+/// even if they would normally be granted by the kernel.
+///
+/// We don't fail the sandbox on errors; we just log unexpected ones.
+fn drop_caps_best_effort() {
+    use nix::errno::Errno;
+
+    for cap in 0..=63 {
+        let rc = unsafe {
+            libc::prctl(
+                libc::PR_CAPBSET_DROP,
+                cap as libc::c_ulong,
+                0,
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            let e = Errno::last();
+            // EINVAL: invalid cap number (past last_cap) → ignore.
+            // EPERM : not permitted to drop this cap    → ignore.
+            if e != Errno::EINVAL && e != Errno::EPERM {
+                log_error(&format!("PR_CAPBSET_DROP({cap}) failed: {e}"));
+            }
+        }
+    }
+
+    v3!("capabilities: bounding set cleared (best-effort)");
+}
+
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
 ///
 /// Order: USER → (UTS?) → MNT (+new-root/overlay) → PID
@@ -217,16 +253,16 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
 
     v2!(
-    "starting sandbox: user={} pid={} mnt={} net={} new_root={:?} minimal_rootfs={} cursed={} cursed_host={}",
-    opts.use_user,
-    opts.use_pid,
-    opts.use_mnt,
-    opts.use_net,
-    opts.new_root,
-    opts.minimal_rootfs,
-    opts.cursed,
-    opts.cursed_host,
-);
+        "starting sandbox: user={} pid={} mnt={} net={} new_root={:?} minimal_rootfs={} cursed={} cursed_host={}",
+        opts.use_user,
+        opts.use_pid,
+        opts.use_mnt,
+        opts.use_net,
+        opts.new_root,
+        opts.minimal_rootfs,
+        opts.cursed,
+        opts.cursed_host,
+    );
 
     // 0) User namespace first (enables unprivileged mounts inside)
     if opts.use_user {
@@ -240,7 +276,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
     }
     maybe_enter_uts_ns_if_needed(&opts.hostname)?;
 
-        // 0.75) Optional network namespace
+    // 0.75) Optional network namespace
     if opts.use_net {
         v2!("unshare(CLONE_NEWNET) — new network namespace");
         unshare(CloneFlags::CLONE_NEWNET)?;
@@ -261,8 +297,6 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             }
         }
     }
-
-    // (later we can call cursed::apply_cursed_policies(opts) here if desired)
 
     // 1) Isolate mount namespace so our mounts don't leak out.
     if opts.use_mnt {
@@ -436,51 +470,55 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
             // Spawn the actual payload so PID 1 can reap it.
             match unsafe { fork()? } {
-    ForkResult::Child => {
-        // --- Innermost payload child (will exec the target) ---
+                ForkResult::Child => {
+                    // --- Innermost payload child (will exec the target) ---
+                    //
+                    // 1) Drop capabilities from the bounding set as much as
+                    //    possible *before* any possible setuid()/setgid().
+                    drop_caps_best_effort();
 
-        // Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
-        if let Some(uid) = opts.drop_uid {
-            let gid = opts.drop_gid.unwrap_or(uid);
-            v3!("dropping privileges to uid={}, gid={}", uid, gid);
+                    // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
+                    if let Some(uid) = opts.drop_uid {
+                        let gid = opts.drop_gid.unwrap_or(uid);
+                        v3!("dropping privileges to uid={}, gid={}", uid, gid);
 
-            // Clear supplementary groups first.
-            unsafe {
-                libc::setgroups(0, std::ptr::null());
-            }
+                        // Clear supplementary groups first.
+                        unsafe {
+                            libc::setgroups(0, std::ptr::null());
+                        }
 
-            if unsafe { libc::setgid(gid) } != 0 {
-                log_error(&format!(
-                    "setgid({}) failed: {}",
-                    gid,
-                    Errno::last()
-                ));
-                std::process::exit(127);
-            }
-            if unsafe { libc::setuid(uid) } != 0 {
-                log_error(&format!(
-                    "setuid({}) failed: {}",
-                    uid,
-                    Errno::last()
-                ));
-                std::process::exit(127);
-            }
+                        if unsafe { libc::setgid(gid) } != 0 {
+                            log_error(&format!(
+                                "setgid({}) failed: {}",
+                                gid,
+                                Errno::last()
+                            ));
+                            std::process::exit(127);
+                        }
+                        if unsafe { libc::setuid(uid) } != 0 {
+                            log_error(&format!(
+                                "setuid({}) failed: {}",
+                                uid,
+                                Errno::last()
+                            ));
+                            std::process::exit(127);
+                        }
 
-            v3!("privilege drop complete");
-        }
+                        v3!("privilege drop complete");
+                    }
 
-        // Apply env rules in the innermost child before exec.
-        if let Err(e) = apply_env(opts) {
-            log_error(&format!("failed to apply env: {e}"));
-            std::process::exit(127);
-        }
+                    // 3) Apply env rules in the innermost child before exec.
+                    if let Err(e) = apply_env(opts) {
+                        log_error(&format!("failed to apply env: {e}"));
+                        std::process::exit(127);
+                    }
 
-        v3!("execvp({:?}, ...)", argv[0]);
-        // Exec the target (on success, never returns)
-        let e = execvp(&argv[0], argv).unwrap_err();
-        log_error(&format!("exec failed: {e}"));
-        std::process::exit(127);
-    }
+                    v3!("execvp({:?}, ...)", argv[0]);
+                    // Exec the target (on success, never returns)
+                    let e = execvp(&argv[0], argv).unwrap_err();
+                    log_error(&format!("exec failed: {e}"));
+                    std::process::exit(127);
+                }
                 ForkResult::Parent { child } => {
                     // === subreaper + signalfd + full forward + exhaustive reap ===
 

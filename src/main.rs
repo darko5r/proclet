@@ -21,7 +21,7 @@ mod cli;
 use clap::Parser;
 use cli::{Cli, Ns};
 use nix::unistd::pipe;
-use proclet::{cstrings, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts, cursed};
+use proclet::{cstrings, cursed, run_pid_mount, set_log_fd, set_verbosity, ProcletOpts};
 use std::{
     ffi::CStr,
     fs::File,
@@ -32,6 +32,7 @@ use std::{
 };
 
 // ---------- feature gates as booleans ----------
+
 #[cfg(feature = "net")]
 const FEATURE_NET: bool = true;
 #[cfg(not(feature = "net"))]
@@ -80,7 +81,6 @@ fn parse_env_vars(vars: &[String]) -> Result<Vec<(String, String)>, String> {
             if k.is_empty() {
                 return Err(format!("invalid --env '{}': empty key", spec));
             }
-            // Very basic check; NULs are impossible in Rust strings anyway.
             out.push((k.to_string(), v.to_string()));
         } else {
             return Err(format!("invalid --env '{}': expected KEY=VALUE", spec));
@@ -112,10 +112,9 @@ fn print_info(msg: &str) {
 fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_net: bool) {
     let use_color = stderr_is_terminal();
 
-    // Colorize labels, but don't pad them or add extra spaces.
     let label = |s: &str| {
         if use_color {
-            format!("\x1b[36m{}:\x1b[0m", s) // cyan "ns:" / "root:" / "new-root:" ...
+            format!("\x1b[36m{}:\x1b[0m", s)
         } else {
             format!("{}:", s)
         }
@@ -184,7 +183,7 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
         eprintln!("  ]");
     }
 
-    // Env summary (just a hint, not full dump)
+    // Env summary
     if cli.env.is_empty() && !cli.clear_env {
         eprintln!("  {} inherit (default)", label("env"));
     } else {
@@ -237,11 +236,11 @@ fn main() {
     }
 
     // --- Resolve new-root path (explicit or auto) ---
+
     let (new_root_path, auto_root_for_cleanup): (Option<PathBuf>, Option<PathBuf>) =
         if let Some(explicit) = &cli.new_root {
             (Some(PathBuf::from(explicit)), None)
         } else if cli.new_root_auto {
-            // mkdtemp expects a mut char* buffer ending with "XXXXXX\0"
             let mut template = b"/tmp/proclet-XXXXXX\0".to_vec();
             let ptr = template.as_mut_ptr() as *mut libc::c_char;
 
@@ -254,7 +253,6 @@ fn main() {
             let path_str = unsafe { CStr::from_ptr(res) }
                 .to_string_lossy()
                 .into_owned();
-
             let root = PathBuf::from(path_str);
             (Some(root.clone()), Some(root))
         } else {
@@ -277,7 +275,7 @@ fn main() {
     }
 
     // Parse env vars early so we can fail with a clear message.
-    let env_pairs = match parse_env_vars(&cli.env) {
+    let mut env_pairs = match parse_env_vars(&cli.env) {
         Ok(p) => p,
         Err(msg) => {
             print_error(&msg);
@@ -324,8 +322,6 @@ fn main() {
     // If we are in v2+ mode, set up the logging pipe & thread.
     if verbosity >= 2 {
         let (read_fd, write_fd) = pipe().expect("proclet: pipe() failed for logger");
-
-        // nix 0.29 pipe() returns (OwnedFd, OwnedFd); convert to RawFd.
         set_log_fd(write_fd.into_raw_fd());
         spawn_logger_thread(read_fd.into_raw_fd());
     }
@@ -340,6 +336,10 @@ fn main() {
     let mut use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
     let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net));
 
+    // Privilege-drop targets (from --as-user or smart GUI mode)
+    let mut drop_uid: Option<u32> = cli.as_user;
+    let mut drop_gid: Option<u32> = cli.as_user;
+
     // --- Cursed semantics ---
 
     // HyperRoot lab: fully sandboxed, max power inside userns.
@@ -347,8 +347,6 @@ fn main() {
         use_user = true;
         use_pid = true;
         use_mnt = true;
-        // when net namespace is wired, we can also enable it here if desired
-        // use_net = true;
     }
 
     // Host-cursed: no user namespace, but still use PID+MNT isolation.
@@ -363,7 +361,6 @@ fn main() {
             std::process::exit(1);
         }
 
-        // Only show the scary banner for interactive use.
         if io::stderr().is_terminal() {
             eprintln!(
                 "\x1b[31mproclet: WARNING: --cursed-host will run with real host root powers.\x1b[0m"
@@ -371,6 +368,76 @@ fn main() {
             eprintln!("proclet: Changes may permanently affect the host kernel and filesystem.");
             eprintln!("proclet: Press Ctrl+C now to abort, or wait 5 seconds to continue...");
             std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
+    // --- Explicit rule: --as-user + userns is not supported (yet) -------------
+    if cli.as_user.is_some() && use_user {
+        print_error(
+            "--as-user cannot currently be combined with --ns user.\n\
+             Hint: remove --ns user or drop --as-user.",
+        );
+        std::process::exit(64); // EX_USAGE
+    }
+
+    // --- Smart GUI mode (root + GUI binary, no explicit --as-user) ------------
+    if drop_uid.is_none()
+        && !cli.cursed
+        && !cli.cursed_host
+        && std::env::var_os("PROCLET_NO_SMART_GUI").is_none()
+    {
+        let euid = unsafe { libc::geteuid() };
+        if euid == 0 {
+            if let Some(first) = cli.cmd.first() {
+                let argv0 = std::path::Path::new(first)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(first.as_str());
+
+                const GUI_BROWSERS: &[&str] = &[
+                    "google-chrome-stable",
+                    "google-chrome",
+                    "chromium",
+                    "chromium-browser",
+                    "microsoft-edge",
+                    "microsoft-edge-stable",
+                    "msedge",
+                    "brave",
+                    "opera",
+                    "vivaldi",
+                    "firefox",
+                    "firefox-bin",
+                ];
+
+                if GUI_BROWSERS.iter().any(|&name| name == argv0) {
+                    let uid = std::env::var("PROCLET_GUI_UID")
+                        .ok()
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(1000);
+
+                    // If userns was requested, we prefer pid/mnt only for GUI.
+                    if use_user {
+                        use_user = false;
+                    }
+
+                    drop_uid = Some(uid);
+                    drop_gid = Some(uid);
+
+                    // Inject HOME=/tmp/proclet-UID-argv0 if user did not set HOME explicitly.
+                    let has_home_override = env_pairs.iter().any(|(k, _)| k == "HOME");
+                    if !has_home_override {
+                        let home = format!("/tmp/proclet-{}-{}", uid, argv0);
+                        env_pairs.push(("HOME".to_string(), home));
+                    }
+
+                    if verbosity > 0 {
+                        print_info(&format!(
+                            "auto: detected GUI browser '{}', running as uid={} with pid+mnt namespaces (no userns)",
+                            argv0, uid
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -401,7 +468,6 @@ fn main() {
         FEATURE_REACTOR,
     );
 
-    // v1: human summary
     if verbosity > 0 {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);
     }
@@ -433,7 +499,6 @@ fn main() {
         None
     };
 
-    // Build ProcletOpts, now with drop_uid/drop_gid wired from --as-user
     let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
@@ -474,12 +539,12 @@ fn main() {
         cursed: cli.cursed,
         cursed_host: cli.cursed_host,
 
-        // NEW: privilege drop inside sandbox
-        drop_uid: cli.as_user,
-        drop_gid: cli.as_user, // same UID/GID for now
+        // privilege drop knobs (now controlled by smart GUI or --as-user)
+        drop_uid,
+        drop_gid,
     };
 
-    // ── Apply cursed profiles (mutually exclusive already checked above) ───────
+    // ── Apply cursed profiles (mutually exclusive, already validated) ─────────
     if cli.cursed {
         cursed::apply_lab_mode(&mut opts);
     } else if cli.cursed_host {
@@ -495,13 +560,16 @@ fn main() {
     };
 
     if let Some(root) = cleanup_root {
-        // Best-effort; log only in debug builds.
         match std::fs::remove_dir_all(&root) {
             Ok(_) => {
                 dbgln!("auto-clean-new-root: removed {:?}", root);
             }
             Err(e) => {
-                dbgln!("auto-clean-new-root: failed to remove {:?}: {}", root, e);
+                dbgln!(
+                    "auto-clean-new-root: failed to remove {:?}: {}",
+                    root,
+                    e
+                );
             }
         }
     }
