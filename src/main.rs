@@ -89,6 +89,126 @@ fn parse_env_vars(vars: &[String]) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// Lookup username + home directory for a given uid using getpwuid().
+fn user_info_for_uid(uid: u32) -> Option<(String, String)> {
+    unsafe {
+        let pw = libc::getpwuid(uid as libc::uid_t);
+        if pw.is_null() {
+            return None;
+        }
+        let pw = *pw;
+        let name = if !pw.pw_name.is_null() {
+            CStr::from_ptr(pw.pw_name)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            uid.to_string()
+        };
+        let home = if !pw.pw_dir.is_null() {
+            CStr::from_ptr(pw.pw_dir)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            format!("/home/{name}")
+        };
+        Some((name, home))
+    }
+}
+
+/// When we drop to `uid` inside the sandbox, also re-home the environment
+/// so GUI apps (Chrome, dconf, DBus, etc.) behave like a normal user session.
+/// session, but avoid breaking an already-working DISPLAY / Wayland setup.
+fn tweak_env_for_uid(env_pairs: &mut Vec<(String, String)>, uid: u32) {
+    let (user, home) = match user_info_for_uid(uid) {
+        Some(info) => info,
+        None => (uid.to_string(), format!("/home/{uid}")),
+    };
+
+    // Helper: check if parent process (the root shell) already has this var set
+    let parent_has = |name: &str| std::env::var_os(name).is_some();
+
+    // Always override these to look like the target uid (unless user explicitly
+    // passed them via --env).
+    for (k, v) in [
+        ("HOME", home.clone()),
+        ("USER", user.clone()),
+        ("LOGNAME", user.clone()),
+    ] {
+        if !env_pairs.iter().any(|(ek, _)| ek == k) {
+            env_pairs.push((k.to_string(), v));
+        }
+    }
+
+    // XDG_CONFIG_HOME / XDG_CACHE_HOME:
+    // only set if parent env does NOT define them and user didn't override.
+    if !parent_has("XDG_CONFIG_HOME")
+        && !env_pairs.iter().any(|(k, _)| k == "XDG_CONFIG_HOME")
+    {
+        env_pairs.push((
+            "XDG_CONFIG_HOME".to_string(),
+            format!("{home}/.config"),
+        ));
+    }
+
+    if !parent_has("XDG_CACHE_HOME")
+        && !env_pairs.iter().any(|(k, _)| k == "XDG_CACHE_HOME")
+    {
+        env_pairs.push((
+            "XDG_CACHE_HOME".to_string(),
+            format!("{home}/.cache"),
+        ));
+    }
+
+    // IMPORTANT: do NOT touch XDG_RUNTIME_DIR.
+    //
+    // Your root KDE/Wayland session is using whatever XDG_RUNTIME_DIR it set
+    // up (very likely /run/user/0), and the Wayland socket lives there.
+    // If we re-home this to /run/user/$uid, Chrome can no longer see the
+    // compositor. So we leave XDG_RUNTIME_DIR exactly as the parent had it.
+
+    // XAUTHORITY:
+    // Only synthesize an empty one if *neither* the parent nor --env define it.
+    // This way, if your root env already has a working XAUTHORITY, we don't
+    // break it.
+    if !parent_has("XAUTHORITY")
+        && !env_pairs.iter().any(|(k, _)| k == "XAUTHORITY")
+    {
+        env_pairs.push(("XAUTHORITY".to_string(), String::new()));
+    }
+
+    // --- dconf / Flatpak path cleanup ---------------------------------------
+    //
+    // Root's XDG_DATA_DIRS may contain /root/.local/share/flatpak/exports/share,
+    // which becomes unreadable for uid 1000 and makes dconf spam that
+    // "Unable to open /root/.local/share/flatpak/exports/share/dconf/profile/user"
+    // warning. For non-root uids, we can safely strip that segment.
+    if uid != 0
+        && !env_pairs.iter().any(|(k, _)| k == "XDG_DATA_DIRS")
+    {
+        if let Ok(parent_dirs) = std::env::var("XDG_DATA_DIRS") {
+            let cleaned = parent_dirs
+                .split(':')
+                .filter(|p| *p != "/root/.local/share/flatpak/exports/share")
+                .collect::<Vec<_>>()
+                .join(":");
+
+            if cleaned != parent_dirs {
+                env_pairs.push(("XDG_DATA_DIRS".to_string(), cleaned));
+            }
+        }
+    }
+
+    // --- dconf profile tweak -------------------------------------------------
+    //
+    // If we're dropping to a non-root uid and no explicit profile was set via
+    // --env, ask dconf to use the standard "user" profile (which will now be
+    // searched in non-root data dirs).
+    if uid != 0 && !env_pairs.iter().any(|(k, _)| k == "DCONF_PROFILE") {
+        env_pairs.push(("DCONF_PROFILE".to_string(), "user".to_string()));
+    }
+}
+
+
 fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
@@ -380,6 +500,11 @@ fn main() {
         std::process::exit(64); // EX_USAGE
     }
 
+    // If user explicitly requested --as-user, also re-home env for that uid.
+    if let Some(uid) = cli.as_user {
+        tweak_env_for_uid(&mut env_pairs, uid);
+    }
+
     // --- Smart GUI mode (root + GUI binary, no explicit --as-user) ------------
     if drop_uid.is_none()
         && !cli.cursed
@@ -423,12 +548,8 @@ fn main() {
                     drop_uid = Some(uid);
                     drop_gid = Some(uid);
 
-                    // Inject HOME=/tmp/proclet-UID-argv0 if user did not set HOME explicitly.
-                    let has_home_override = env_pairs.iter().any(|(k, _)| k == "HOME");
-                    if !has_home_override {
-                        let home = format!("/tmp/proclet-{}-{}", uid, argv0);
-                        env_pairs.push(("HOME".to_string(), home));
-                    }
+                    // Make env look like this uid's regular session (HOME, XDG_*, DBUS, etc.)
+                    tweak_env_for_uid(&mut env_pairs, uid);
 
                     if verbosity > 0 {
                         print_info(&format!(
