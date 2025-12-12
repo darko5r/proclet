@@ -206,6 +206,10 @@ pub struct ProcletOpts {
     /// Useful for running GUI apps from root while keeping Chrome's own sandbox.
     pub drop_uid: Option<u32>,
     pub drop_gid: Option<u32>,
+
+    /// Enable best-effort GPU shim (bind-mount /dev/dri* / /dev/nvidia* into sandbox).
+    /// For now this is just a flag; main.rs decides when to turn it on.
+    pub shim_gpu: bool,
 }
 
 /// Best-effort capability hardening for the payload child.
@@ -242,6 +246,36 @@ fn drop_caps_best_effort() {
     }
 
     v3!("capabilities: bounding set cleared (best-effort)");
+}
+
+fn setup_gpu_shim(opts: &ProcletOpts) -> Result<(), Errno> {
+    use std::fs;
+    use std::path::PathBuf;
+
+    // Decide where /dev is visible from inside the sandbox:
+    // - if we have a chroot/new_root, use <new_root>/dev
+    // - otherwise use the host /dev (inside our private mount ns)
+    let dev_root: PathBuf = if let Some(ref root) = opts.new_root {
+        root.join("dev")
+    } else {
+        PathBuf::from("/dev")
+    };
+
+    let dri_path = dev_root.join("dri");
+
+    // Best-effort: ensure the directory exists.
+    let _ = fs::create_dir_all(&dri_path);
+
+    v2!("gpu-shim: mounting empty tmpfs on {:?}", dri_path);
+    mount::<str, Path, str, str>(
+        Some("tmpfs"),
+        &dri_path,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some("size=4M,mode=755"),
+    )?;
+
+    Ok(())
 }
 
 /// Run `argv` inside namespaces. Child acts as PID 1 if PID ns is used.
@@ -405,6 +439,15 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
                 Some("size=512M"),
             )?;
+        }
+
+         // Optional GPU shim: hide real DRM devices so libEGL doesn't
+        // spam "driver (null)" messages. This trades GPU offload for a
+        // quieter log / software rendering.
+        if opts.shim_gpu {
+            if let Err(e) = setup_gpu_shim(opts) {
+                v2!("gpu-shim: failed to set up: {e}, continuing without shim");
+            }
         }
 
         // Apply readonly_root: if we have a new_root, remount that; otherwise `/`.

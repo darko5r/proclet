@@ -208,7 +208,6 @@ fn tweak_env_for_uid(env_pairs: &mut Vec<(String, String)>, uid: u32) {
     }
 }
 
-
 fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
@@ -281,7 +280,7 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     eprintln!("  {} {}", label("new-root"), root_desc);
 
-    // overlay summary
+    // overlay summary  (back to your original form → no E0560 here)
     if let Some(ref lower) = cli.overlay_lower {
         eprintln!("  {} lower={}", label("overlay"), lower);
     } else {
@@ -417,7 +416,7 @@ fn main() {
             "setting hostname requires the `uts` feature (requested --hostname ...).\n\
              Rebuild with: cargo build --features uts",
         );
-        std::process::exit(64); // EX_USAGE
+        std::process::exit(64); // EX_USAGE;
     }
 
     // Validate command vector (common mistake: extra `--` inside cmd)
@@ -620,6 +619,18 @@ fn main() {
         None
     };
 
+    // Decide whether to enable GPU shim for this run.
+    //
+    // Default: enable when we are dropping privileges to a GUI uid,
+    // unless PROCLET_NO_GPU_SHIM is set in the environment.
+    // let shim_gpu =
+    //     drop_uid.is_some() && std::env::var_os("PROCLET_NO_GPU_SHIM").is_none();
+
+    // GPU shim is now *opt-in* via PROCLET_GPU_SHIM.
+    // Default: expose real /dev/dri and NVIDIA to the sandbox.
+    let shim_gpu = std::env::var_os("PROCLET_GPU_SHIM").is_some();
+
+
     let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),
@@ -663,6 +674,9 @@ fn main() {
         // privilege drop knobs (now controlled by smart GUI or --as-user)
         drop_uid,
         drop_gid,
+
+        // NEW: GPU shim (implemented in the proclet library, inside the mount ns)
+        shim_gpu,
     };
 
     // ── Apply cursed profiles (mutually exclusive, already validated) ─────────
