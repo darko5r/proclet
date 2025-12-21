@@ -116,8 +116,8 @@ fn user_info_for_uid(uid: u32) -> Option<(String, String)> {
 }
 
 /// When we drop to `uid` inside the sandbox, also re-home the environment
-/// so GUI apps (Chrome, dconf, DBus, etc.) behave like a normal user session.
-/// session, but avoid breaking an already-working DISPLAY / Wayland setup.
+/// so GUI apps (Chrome, dconf, DBus, etc.) behave like a normal user session,
+/// but avoid breaking an already-working DISPLAY / Wayland setup.
 fn tweak_env_for_uid(env_pairs: &mut Vec<(String, String)>, uid: u32) {
     let (user, home) = match user_info_for_uid(uid) {
         Some(info) => info,
@@ -280,7 +280,7 @@ fn print_summary(cli: &Cli, use_user: bool, use_pid: bool, use_mnt: bool, use_ne
 
     eprintln!("  {} {}", label("new-root"), root_desc);
 
-    // overlay summary  (back to your original form → no E0560 here)
+    // overlay summary
     if let Some(ref lower) = cli.overlay_lower {
         eprintln!("  {} lower={}", label("overlay"), lower);
     } else {
@@ -455,6 +455,12 @@ fn main() {
     let mut use_mnt = cli.ns.iter().any(|n| matches!(n, Ns::Mnt));
     let use_net = cli.ns.iter().any(|n| matches!(n, Ns::Net));
 
+    // Default when no --ns is provided: pid+mnt
+    if cli.ns.is_empty() {
+        use_pid = true;
+        use_mnt = true;
+    }
+
     // Privilege-drop targets (from --as-user or smart GUI mode)
     let mut drop_uid: Option<u32> = cli.as_user;
     let mut drop_gid: Option<u32> = cli.as_user;
@@ -621,15 +627,9 @@ fn main() {
 
     // Decide whether to enable GPU shim for this run.
     //
-    // Default: enable when we are dropping privileges to a GUI uid,
-    // unless PROCLET_NO_GPU_SHIM is set in the environment.
-    // let shim_gpu =
-    //     drop_uid.is_some() && std::env::var_os("PROCLET_NO_GPU_SHIM").is_none();
-
-    // GPU shim is now *opt-in* via PROCLET_GPU_SHIM.
+    // GPU shim is *opt-in* via PROCLET_GPU_SHIM.
     // Default: expose real /dev/dri and NVIDIA to the sandbox.
     let shim_gpu = std::env::var_os("PROCLET_GPU_SHIM").is_some();
-
 
     let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
