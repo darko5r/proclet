@@ -631,6 +631,18 @@ fn main() {
     // Default: expose real /dev/dri and NVIDIA to the sandbox.
     let shim_gpu = std::env::var_os("PROCLET_GPU_SHIM").is_some();
 
+    // If we are root and we will drop to a non-root uid, point env at the root compositor socket
+// (only if user didn't override via --env).
+if unsafe { libc::geteuid() } == 0 {
+    if let Some(uid) = drop_uid {
+        if uid != 0 {
+            if let Some(parent) = proclet::wayland::find_parent_wayland_socket() {
+                proclet::wayland::ensure_env_points_to_parent_socket(&mut env_pairs, &parent);
+            }
+        }
+    }
+}
+
     let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
         hostname: cli.hostname.clone(),

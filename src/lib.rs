@@ -32,6 +32,7 @@ mod log;
 mod env;
 mod fs;
 mod supervisor;
+pub mod wayland;
 pub mod cursed;
 
 use nix::{
@@ -519,6 +520,20 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     // 1) Drop capabilities from the bounding set as much as
                     //    possible *before* any possible setuid()/setgid().
                     drop_caps_best_effort();
+
+                    // 1.5) Wayland bridge: if we're root and we're about to drop to a non-root uid,
+                    // grant that uid ACL access to the parent (root) Wayland socket.
+                       if unsafe { libc::geteuid() } == 0 {
+                          if let Some(uid) = opts.drop_uid {
+                             if uid != 0 {
+                                if let Some(parent) = crate::wayland::find_parent_wayland_socket() {
+                                let _ = crate::wayland::grant_wayland_acl_best_effort(uid, &parent);
+                             } else {
+                                v2!("wayland: no live parent socket under /run/user/0 found; skipping ACL");
+                            }
+                          }
+                        }
+                      }
 
                     // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
                     if let Some(uid) = opts.drop_uid {
