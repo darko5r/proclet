@@ -39,7 +39,7 @@ pub struct Cli {
         value_enum,
         num_args = 1..,
         value_delimiter = ',',
-        default_values_t = [Ns::User, Ns::Pid, Ns::Mnt]
+        default_values_t = [Ns::Pid, Ns::Mnt]
     )]
     pub ns: Vec<Ns>,
 

@@ -208,6 +208,99 @@ fn tweak_env_for_uid(env_pairs: &mut Vec<(String, String)>, uid: u32) {
     }
 }
 
+// ---------- GUI backend resolver (Wayland -> X11) ----------
+
+fn env_pairs_has(env_pairs: &[(String, String)], k: &str) -> bool {
+    env_pairs.iter().any(|(ek, _)| ek == k)
+}
+
+fn push_candidate(dirs: &mut Vec<PathBuf>, p: PathBuf) {
+    if !dirs.iter().any(|x| x == &p) {
+        dirs.push(p);
+    }
+}
+
+/// Prefer Wayland if a live socket exists; otherwise fall back to X11.
+/// - Never overrides explicit `--env WAYLAND_DISPLAY=` or `--env DISPLAY=`.
+/// - If `--clear-env` is used, we may need to re-inject DISPLAY/XAUTHORITY for X11 fallback.
+fn maybe_configure_gui_env(
+    env_pairs: &mut Vec<(String, String)>,
+    clear_env: bool,
+    drop_uid: Option<u32>,
+) {
+    // Respect explicit intent from the user.
+    if env_pairs_has(env_pairs, "WAYLAND_DISPLAY") || env_pairs_has(env_pairs, "DISPLAY") {
+        return;
+    }
+
+    let euid = unsafe { libc::geteuid() } as u32;
+
+    // Candidate runtime dirs in priority order:
+    // 1) inherited XDG_RUNTIME_DIR
+    // 2) /run/user/$SUDO_UID (safe default on multi-user systems)
+    // 3) /run/user/$drop_uid (if we are dropping privileges)
+    // 4) /run/user/0 (your root-desktop case / last resort when root)
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+        push_candidate(&mut candidates, PathBuf::from(rt));
+    }
+
+    if euid == 0 {
+        if let Ok(s) = std::env::var("SUDO_UID") {
+            if let Ok(uid) = s.parse::<u32>() {
+                push_candidate(&mut candidates, PathBuf::from(format!("/run/user/{uid}")));
+            }
+        }
+    }
+
+    if let Some(uid) = drop_uid {
+        push_candidate(&mut candidates, PathBuf::from(format!("/run/user/{uid}")));
+    }
+
+    if euid == 0 {
+        push_candidate(&mut candidates, PathBuf::from("/run/user/0"));
+    }
+
+    // --- Wayland probe ---
+    //
+    // We only choose Wayland if we can prove a live socket exists.
+    for rt in &candidates {
+        // This function should be added in proclet::wayland (recommended).
+        // If you haven't added it yet, keep using find_parent_wayland_socket() below.
+        if let Some(parent) = proclet::wayland::probe_wayland_runtime(rt.as_path()) {
+            proclet::wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
+            return;
+        }
+    }
+
+    // Fallback if you haven't implemented probe_wayland_runtime yet:
+    // try the original "root compositor" helper (keeps old behavior as a safety net).
+    if euid == 0 {
+        if let Some(parent) = proclet::wayland::find_parent_wayland_socket() {
+            proclet::wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
+            return;
+        }
+    }
+
+    // --- X11 fallback ---
+    //
+    // If we inherit env (clear_env=false), DISPLAY is already inherited and we
+    // should not inject anything.
+    if clear_env {
+        if let Ok(display) = std::env::var("DISPLAY") {
+            if !env_pairs_has(env_pairs, "DISPLAY") {
+                env_pairs.push(("DISPLAY".to_string(), display));
+            }
+        }
+        if let Ok(xauth) = std::env::var("XAUTHORITY") {
+            if !env_pairs_has(env_pairs, "XAUTHORITY") {
+                env_pairs.push(("XAUTHORITY".to_string(), xauth));
+            }
+        }
+    }
+}
+
 fn stderr_is_terminal() -> bool {
     io::stderr().is_terminal()
 }
@@ -496,18 +589,34 @@ fn main() {
         }
     }
 
-    // --- Explicit rule: --as-user + userns is not supported (yet) -------------
-    if cli.as_user.is_some() && use_user {
-        print_error(
-            "--as-user cannot currently be combined with --ns user.\n\
-             Hint: remove --ns user or drop --as-user.",
-        );
-        std::process::exit(64); // EX_USAGE
+    let euid = unsafe { libc::geteuid() } as u32;
+
+    if let Some(target_uid) = cli.as_user {
+        if use_user {
+            // If we're real root, userns is skipped anyway (enter_userns_map_root()),
+            // so allow it.
+            if euid == 0 {
+                // ok
+            } else {
+                // Non-root + userns mapping is "0 <-> euid 1" in your code,
+                // so the only realistic --as-user is yourself.
+                if target_uid != euid {
+                    print_error(
+                        "--as-user with --ns user is only supported for your own UID when running unprivileged.\n\
+                     Hint: drop --ns user, or use --as-user <your-uid>.",
+                    );
+                    std::process::exit(64);
+                }
+            }
+        }
     }
 
     // If user explicitly requested --as-user, also re-home env for that uid.
     if let Some(uid) = cli.as_user {
         tweak_env_for_uid(&mut env_pairs, uid);
+
+        // NEW: prefer Wayland if live; fallback to X11 (especially with --clear-env)
+        maybe_configure_gui_env(&mut env_pairs, cli.clear_env, drop_uid);
     }
 
     // --- Smart GUI mode (root + GUI binary, no explicit --as-user) ------------
@@ -555,6 +664,9 @@ fn main() {
 
                     // Make env look like this uid's regular session (HOME, XDG_*, DBUS, etc.)
                     tweak_env_for_uid(&mut env_pairs, uid);
+
+                    // NEW: prefer Wayland if live; fallback to X11
+                    maybe_configure_gui_env(&mut env_pairs, cli.clear_env, drop_uid);
 
                     if verbosity > 0 {
                         print_info(&format!(
@@ -632,16 +744,15 @@ fn main() {
     let shim_gpu = std::env::var_os("PROCLET_GPU_SHIM").is_some();
 
     // If we are root and we will drop to a non-root uid, point env at the root compositor socket
-// (only if user didn't override via --env).
-if unsafe { libc::geteuid() } == 0 {
-    if let Some(uid) = drop_uid {
-        if uid != 0 {
-            if let Some(parent) = proclet::wayland::find_parent_wayland_socket() {
-                proclet::wayland::ensure_env_points_to_parent_socket(&mut env_pairs, &parent);
+    // (only if user didn't override via --env).
+    // NOTE: we now delegate this to maybe_configure_gui_env(), which also supports X11 fallback.
+    if unsafe { libc::geteuid() } == 0 {
+        if let Some(uid) = drop_uid {
+            if uid != 0 {
+                maybe_configure_gui_env(&mut env_pairs, cli.clear_env, drop_uid);
             }
         }
     }
-}
 
     let mut opts = ProcletOpts {
         mount_proc: !cli.no_proc,
