@@ -1,3 +1,4 @@
+// src/wayland.rs
 use crate::log_error;
 use nix::errno::Errno;
 use std::{
@@ -7,21 +8,17 @@ use std::{
     process::Command,
 };
 
-/// Result of probing a compositor socket we can connect to.
 #[derive(Debug, Clone)]
 pub struct ParentWayland {
-    pub runtime_dir: PathBuf, // e.g. /run/user/1000 or /run/user/0
-    pub socket_name: String,  // e.g. wayland-0
-    pub socket_path: PathBuf, // e.g. /run/user/1000/wayland-0
+    pub runtime_dir: PathBuf,
+    pub socket_name: String,
+    pub socket_path: PathBuf,
 }
 
-/// Try to connect to a unix socket path to ensure it is live.
-/// This avoids false positives where a stale socket file exists but compositor is gone.
 fn socket_is_live(p: &Path) -> bool {
     UnixStream::connect(p).is_ok()
 }
 
-/// Check whether a path is a unix socket.
 fn path_is_socket(p: &Path) -> bool {
     std::fs::metadata(p)
         .ok()
@@ -29,7 +26,6 @@ fn path_is_socket(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Return username for uid using getpwuid (no external `getent` dependency).
 fn username_for_uid(uid: u32) -> Option<String> {
     unsafe {
         let pw = libc::getpwuid(uid as libc::uid_t);
@@ -44,13 +40,11 @@ fn username_for_uid(uid: u32) -> Option<String> {
     }
 }
 
-/// Try to find a live Wayland compositor socket inside `runtime_dir`.
-///
-/// Preference order:
-/// 1) `wayland-0` if present and live (common case)
-/// 2) first live `wayland-*` socket found
+pub fn runtime_dir_for_uid(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/run/user/{uid}"))
+}
+
 pub fn probe_wayland_runtime(runtime_dir: &Path) -> Option<ParentWayland> {
-    // Prefer wayland-0 first (common case)
     let preferred = runtime_dir.join("wayland-0");
     if path_is_socket(&preferred) && socket_is_live(&preferred) {
         return Some(ParentWayland {
@@ -85,16 +79,6 @@ pub fn probe_wayland_runtime(runtime_dir: &Path) -> Option<ParentWayland> {
     None
 }
 
-/// Find a live Wayland socket based on the current environment.
-///
-/// Strategy:
-/// 1) If $XDG_RUNTIME_DIR and $WAYLAND_DISPLAY are set and point to a live socket, use that.
-/// 2) Else scan $XDG_RUNTIME_DIR for wayland-*.
-/// 3) Else (best-effort) if running as root, try /run/user/0.
-/// 4) Else give up.
-///
-/// Note: policy about *which* runtime dirs should be trusted belongs in the caller.
-/// This function is intentionally just a probe.
 pub fn find_parent_wayland_socket() -> Option<ParentWayland> {
     // 1) Prefer environment if it looks valid.
     if let (Some(rt_os), Some(disp)) = (
@@ -132,24 +116,11 @@ pub fn find_parent_wayland_socket() -> Option<ParentWayland> {
     None
 }
 
-/// Best-effort ACL grant for connecting to a compositor socket owned by another user.
-/// This mirrors:
-///   setfacl -m u:USER:rx /run/user/<owner>
-///   setfacl -m u:USER:rw /run/user/<owner>/wayland-0
-///
-/// Notes:
-/// - We run this as root, before dropping privileges.
-/// - We intentionally do NOT fail the sandbox if ACL tooling is missing.
-/// - This grant is *persistent* unless you implement revocation in the caller.
-pub fn grant_wayland_acl_best_effort(
-    target_uid: u32,
-    parent: &ParentWayland,
-) -> Result<(), Errno> {
+pub fn grant_wayland_acl_best_effort(target_uid: u32, parent: &ParentWayland) -> Result<(), Errno> {
     if target_uid == 0 {
-        return Ok(()); // nothing to do
+        return Ok(());
     }
 
-    // Prefer username, but fall back to numeric uid if lookup fails.
     let user_spec = match username_for_uid(target_uid) {
         Some(name) => name,
         None => {
@@ -161,11 +132,10 @@ pub fn grant_wayland_acl_best_effort(
         }
     };
 
-    // Use setfacl if available. Two calls to keep it readable.
     let sock = parent.socket_path.to_string_lossy().to_string();
     let dir = parent.runtime_dir.to_string_lossy().to_string();
 
-    // 1) Grant rw on the socket
+    // socket: rw
     let st1 = Command::new("setfacl")
         .args(["-m", &format!("u:{}:rw", user_spec), &sock])
         .status();
@@ -185,7 +155,8 @@ pub fn grant_wayland_acl_best_effort(
         }
     }
 
-    // 2) Grant rx on the runtime dir (needed to reach the socket path)
+    // runtime dir: rx (often not strictly needed if you bind into /run/user/<uid>,
+    // but harmless as best-effort)
     let st2 = Command::new("setfacl")
         .args(["-m", &format!("u:{}:rx", user_spec), &dir])
         .status();
@@ -206,8 +177,6 @@ pub fn grant_wayland_acl_best_effort(
     }
 }
 
-/// Ensure env contains what is needed to talk to the compositor socket.
-/// We only set values if they are missing, so explicit --env overrides win.
 pub fn ensure_env_points_to_parent_socket(env_pairs: &mut Vec<(String, String)>, parent: &ParentWayland) {
     fn set_if_missing(env: &mut Vec<(String, String)>, k: &str, v: String) {
         if !env.iter().any(|(ek, _)| ek == k) {

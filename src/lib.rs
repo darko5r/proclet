@@ -32,8 +32,10 @@ mod log;
 mod env;
 mod fs;
 mod supervisor;
+
 pub mod wayland;
 pub mod cursed;
+pub mod gui;
 
 use nix::{
     errno::Errno,
@@ -66,6 +68,17 @@ pub use log::{log_error, set_log_fd, set_verbosity};
 #[inline]
 fn to_errno(e: io::Error) -> Errno {
     Errno::from_raw(e.raw_os_error().unwrap_or(libc::EIO))
+}
+
+/// Add context to mount-ish errors so we don’t get “ENOTDIR” with no clue where.
+fn ctx<T>(what: &str, r: Result<T, nix::Error>) -> Result<T, nix::Error> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            crate::log_error(&format!("mount step failed: {what}: {e}"));
+            Err(e)
+        }
+    }
 }
 
 fn write_file(path: &str, s: &str) -> Result<(), Errno> {
@@ -339,15 +352,17 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         unshare(CloneFlags::CLONE_NEWNS)?;
 
         v2!("remount / as MS_PRIVATE|MS_REC (best-effort)");
-        if let Err(e) = mount::<str, str, str, str>(
-            None,
-            "/",
-            None,
-            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-            None,
+        if let Err(e) = ctx(
+            "remount / MS_PRIVATE|MS_REC",
+            mount::<str, str, str, str>(
+                None,
+                "/",
+                None,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None,
+            ),
         ) {
             v2!("remount / as MS_PRIVATE|MS_REC failed: {e}, continuing");
-            // We continue anyway; worst case: mounts may be shared with the host.
         }
 
         // If a new_root is requested, prepare it:
@@ -367,12 +382,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     root
                 );
                 mount_overlay(root, lower, upper, work)?;
+            } else if opts.minimal_rootfs {
+                build_minimal_rootfs(root)?;
             } else {
-                if opts.minimal_rootfs {
-                    build_minimal_rootfs(root)?;
-                } else {
-                    prepare_new_root(root, opts.new_root_auto)?;
-                }
+                prepare_new_root(root, opts.new_root_auto)?;
             }
 
             // Copy extra files into the (possibly overlay-backed) root
@@ -396,25 +409,48 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
         }
 
         // Apply user-specified bind mounts before readonly root.
+        //
+        // IMPORTANT: binds may be directory binds OR file binds (e.g. Wayland socket).
+        // Creating the wrong kind of target is a common cause of ENOTDIR/ENOENT.
         for (host, inside, ro) in &opts.binds {
-            // Ensure the target exists (best-effort for dirs)
-            let _ = std::fs::create_dir_all(inside);
+            let host_is_dir = std::fs::metadata(host)
+                .ok()
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+
+            if host_is_dir {
+                let _ = std::fs::create_dir_all(inside);
+            } else {
+                if let Some(parent) = inside.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Create a placeholder file target (bind-mount will cover it).
+                let _ = OpenOptions::new().create(true).write(true).open(inside);
+            }
+
             v3!("bind {:?} -> {:?} (ro={})", host, inside, ro);
-            mount(
-                Some(host.as_path()),
-                inside,
-                None::<&str>,
-                MsFlags::MS_BIND | MsFlags::MS_REC,
-                None::<&str>,
-            )?;
-            if *ro {
-                // Remount bind as read-only
-                mount::<str, Path, str, str>(
-                    None,
+
+            ctx(
+                &format!("bind mount {} -> {}", host.display(), inside.display()),
+                mount(
+                    Some(host.as_path()),
                     inside,
-                    None,
-                    MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
-                    None,
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                ),
+            )?;
+
+            if *ro {
+                ctx(
+                    &format!("remount ro {}", inside.display()),
+                    mount::<str, Path, str, str>(
+                        None,
+                        inside,
+                        None,
+                        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                        None,
+                    ),
                 )?;
             }
         }
@@ -442,7 +478,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             )?;
         }
 
-         // Optional GPU shim: hide real DRM devices so libEGL doesn't
+        // Optional GPU shim: hide real DRM devices so libEGL doesn't
         // spam "driver (null)" messages. This trades GPU offload for a
         // quieter log / software rendering.
         if opts.shim_gpu {
@@ -502,6 +538,7 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 v2!("mounting fresh /proc");
                 setup_proc()?;
             }
+
             if let Some(dir) = &opts.chdir {
                 chdir(dir)?;
             }
@@ -516,24 +553,10 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             match unsafe { fork()? } {
                 ForkResult::Child => {
                     // --- Innermost payload child (will exec the target) ---
-                    //
+
                     // 1) Drop capabilities from the bounding set as much as
                     //    possible *before* any possible setuid()/setgid().
                     drop_caps_best_effort();
-
-                    // 1.5) Wayland bridge: if we're root and we're about to drop to a non-root uid,
-                    // grant that uid ACL access to the parent (root) Wayland socket.
-                       if unsafe { libc::geteuid() } == 0 {
-                          if let Some(uid) = opts.drop_uid {
-                             if uid != 0 {
-                                if let Some(parent) = crate::wayland::find_parent_wayland_socket() {
-                                let _ = crate::wayland::grant_wayland_acl_best_effort(uid, &parent);
-                             } else {
-                                v2!("wayland: no live parent socket under /run/user/0 found; skipping ACL");
-                            }
-                          }
-                        }
-                      }
 
                     // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
                     if let Some(uid) = opts.drop_uid {
@@ -546,19 +569,11 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                         }
 
                         if unsafe { libc::setgid(gid) } != 0 {
-                            log_error(&format!(
-                                "setgid({}) failed: {}",
-                                gid,
-                                Errno::last()
-                            ));
+                            log_error(&format!("setgid({}) failed: {}", gid, Errno::last()));
                             std::process::exit(127);
                         }
                         if unsafe { libc::setuid(uid) } != 0 {
-                            log_error(&format!(
-                                "setuid({}) failed: {}",
-                                uid,
-                                Errno::last()
-                            ));
+                            log_error(&format!("setuid({}) failed: {}", uid, Errno::last()));
                             std::process::exit(127);
                         }
 
@@ -612,7 +627,6 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     ] {
                         mask.add(s);
                     }
-                    // Block so default handlers won't run; we will read from signalfd.
                     nix::sys::signal::sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)?;
                     v3!("blocked signals and installed signalfd mask");
 
@@ -631,40 +645,23 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
                                 if matches!(sig, Some(Signal::SIGCHLD)) {
                                     v3!("signalfd: received SIGCHLD (pid={})", si.ssi_pid);
-                                    // Reap everything available; capture direct child's exit if any.
                                     if let Some(code) = reap_all(child.as_raw())? {
-                                        v3!(
-                                            "waitpid: pid {} exited with code {}",
-                                            child,
-                                            code
-                                        );
+                                        v3!("waitpid: pid {} exited with code {}", child, code);
                                         exit_code = Some(code);
                                     }
                                 } else if let Some(sig) = sig {
-                                    v3!(
-                                        "forwarding signal {:?} to pgid {}",
-                                        sig,
-                                        payload_pgid
-                                    );
-                                    // Negative PGID means: deliver to the process group.
-                                    unsafe {
-                                        libc::kill(-payload_pgid, sig as i32);
-                                    }
+                                    v3!("forwarding signal {:?} to pgid {}", sig, payload_pgid);
+                                    unsafe { libc::kill(-payload_pgid, sig as i32) };
                                 }
 
-                                // If our direct child is done: graceful shutdown of the group
                                 if let Some(code) = exit_code {
                                     v2!("direct child exited with code {}", code);
-                                    // Best-effort TERM then KILL after a short grace
                                     unsafe { libc::kill(-payload_pgid, libc::SIGTERM) };
-                                    // ~200ms grace
                                     let ts = libc::timespec {
                                         tv_sec: 0,
                                         tv_nsec: 200_000_000,
                                     };
-                                    unsafe {
-                                        libc::nanosleep(&ts, std::ptr::null_mut());
-                                    }
+                                    unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
                                     unsafe { libc::kill(-payload_pgid, libc::SIGKILL) };
 
                                     v2!(
@@ -672,12 +669,8 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                                         payload_pgid
                                     );
 
-                                    // Drain any stragglers before exiting
                                     let _ = reap_all(child.as_raw());
-
-                                    // Restore TTY before exit
                                     tty_guard.restore();
-
                                     return Ok(code);
                                 }
                             }
@@ -685,7 +678,6 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                             Err(e) if e == Errno::EINTR => continue,
                             Err(e) => {
                                 log_error(&format!("signalfd error: {e}"));
-                                // Fallback: try reaping; if direct child is gone, exit with its code
                                 if let Some(code) = reap_all(child.as_raw())? {
                                     tty_guard.restore();
                                     return Ok(code);
@@ -712,14 +704,24 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 fn setup_proc() -> Result<(), Errno> {
     let proc_path = Path::new("/proc");
     let _ = umount2(proc_path, MntFlags::MNT_DETACH);
-    let _ = std::fs::create_dir_all(proc_path);
-    mount::<str, str, str, str>(
-        Some("proc"),
-        "/proc",
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
-        None,
+
+    if let Err(e) = std::fs::create_dir_all(proc_path) {
+        let errno = to_errno(e);
+        log_error(&format!("setup_proc: create_dir_all(/proc) failed: {errno}"));
+        return Err(errno);
+    }
+
+    ctx(
+        "mount proc on /proc",
+        mount::<str, str, str, str>(
+            Some("proc"),
+            "/proc",
+            Some("proc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+            None,
+        ),
     )?;
+
     Ok(())
 }
 
