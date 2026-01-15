@@ -1,6 +1,7 @@
 // src/gui.rs
 use crate::{log_error, wayland};
-use std::path::{PathBuf};
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Prepare a “desktop-like” environment when running as root but dropping to a
@@ -10,11 +11,13 @@ use std::process::Command;
 ///   (host_path, inside_path, read_only)
 ///
 /// Policy:
-/// - Keep XDG_RUNTIME_DIR as /run/user/<uid> for sane DBus + per-user runtime.
-/// - If parent compositor socket is elsewhere (often /run/user/0), bind-mount the
-///   socket inode into /run/user/<uid>/<socket_name>.
-/// - Best-effort ACL grant so uid can connect.
-/// - Avoid breaking explicit user overrides passed via --env.
+/// - Respect explicit user overrides: if WAYLAND_DISPLAY or DISPLAY are provided, do nothing.
+/// - Ensure XDG_RUNTIME_DIR points to /run/user/<uid>.
+/// - Bridge parent Wayland socket if it lives outside target runtime.
+/// - Best-effort: bind PipeWire socket if present.
+/// - Avoid portal/FUSE inside sandbox (document portal mount spam) by disabling portals
+///   in this proclet GUI mode. (This keeps it clean without needing /dev/fuse.)
+/// - Wrap with dbus-run-session (best-effort) unless already wrapped.
 pub fn prepare_desktop(
     env_pairs: &mut Vec<(String, String)>,
     cmd_vec: &mut Vec<String>,
@@ -28,19 +31,26 @@ pub fn prepare_desktop(
         return extra_binds;
     }
 
-    // We always want a sane runtime for the target user.
-    let target_runtime = PathBuf::from(format!("/run/user/{target_uid}"));
-    set_if_missing(env_pairs, "XDG_RUNTIME_DIR", target_runtime.to_string_lossy().to_string());
+    let target_runtime = wayland::runtime_dir_for_uid(target_uid);
+    set_if_missing(
+        env_pairs,
+        "XDG_RUNTIME_DIR",
+        target_runtime.to_string_lossy().to_string(),
+    );
 
-    // Remove root session DBus if user did not explicitly pass it via --env.
-    // (Keeping root's DBUS_SESSION_BUS_ADDRESS while dropping to uid=1000 is a common source of weirdness.)
-    if !env_has(env_pairs, "DBUS_SESSION_BUS_ADDRESS") {
-        // remove inherited one by overwriting to empty only if clear_env was used in main;
-        // since we can’t see clear_env here, we do the safer thing: do nothing.
-        // Instead we’ll prefer wrapping with dbus-run-session below.
-    }
+    // Disable portals for this "minimal desktop" mode to avoid:
+    //  - xdg-document-portal trying to mount FUSE at /run/user/<uid>/doc
+    //  - repeated "Authorization required..." spam from portal/systemd integration
+    //
+    // This is best-effort and only applied if user didn't override it explicitly.
+    set_if_missing(env_pairs, "GTK_USE_PORTAL", "0".to_string());
 
-    // Try to find a live parent Wayland socket (based on current env + fallback probes).
+    // A few harmless desktop hints (do not override user settings).
+    set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
+    set_if_missing(env_pairs, "XDG_CURRENT_DESKTOP", "KDE".to_string());
+    set_if_missing(env_pairs, "DESKTOP_SESSION", "plasma".to_string());
+
+    // Try to find a live parent Wayland socket.
     let parent = match wayland::find_parent_wayland_socket() {
         Some(p) => p,
         None => {
@@ -52,47 +62,54 @@ pub fn prepare_desktop(
         }
     };
 
-    // If the parent socket already lives under the target runtime dir, just point env there.
+    // If the parent socket already lives under target runtime dir, just point env there.
     if parent.runtime_dir == target_runtime {
         wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
-        maybe_wrap_dbus_run_session(cmd_vec, verbosity);
-        return extra_binds;
-    }
+    } else {
+        // Bridge socket inode into /run/user/<uid>/<socket_name>
+        let inside_socket_path = target_runtime.join(&parent.socket_name);
 
-    // Otherwise: bridge the socket inode into the target runtime dir.
-    // Example:
-    //   /run/user/0/wayland-0  ->  /run/user/1000/wayland-0
-    let inside_socket_path = target_runtime.join(&parent.socket_name);
-
-    // Best-effort ACL grant so uid can connect to the socket inode.
-    // (ACL is on the inode; binding it into another path still uses the same inode ACL.)
-    if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
-        if verbosity > 0 {
-            log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
+        // Best-effort ACL grant so uid can connect.
+        if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
+            if verbosity > 0 {
+                log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
+            }
         }
+
+        // Must be RW.
+        extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
+
+        // Point env at the bridged socket.
+        set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
+
+        // Ensure runtime dir is correct for the user.
+        set_override(
+            env_pairs,
+            "XDG_RUNTIME_DIR",
+            target_runtime.to_string_lossy().to_string(),
+        );
     }
 
-    // Tell the sandbox to mount the socket into the user's runtime dir.
-    // Must be RW.
-    extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
-
-    // Now point env at the bridged socket living under /run/user/<uid>.
-    set_if_missing(
-        env_pairs,
-        "WAYLAND_DISPLAY",
-        parent.socket_name.clone(),
-    );
-    set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
-
-    // Ensure we didn’t accidentally leave XDG_RUNTIME_DIR pointing to parent runtime.
-    // (We want DBus in /run/user/<uid>.)
-    set_override(env_pairs, "XDG_RUNTIME_DIR", target_runtime.to_string_lossy().to_string());
+    // Best-effort PipeWire:
+    // bind /run/user/<uid>/pipewire-0 into the sandbox if it exists *and is a socket*.
+    // This avoids portal warnings when something tries to use PipeWire (even if portals are off).
+    let pw = target_runtime.join("pipewire-0");
+    if path_is_socket(&pw) {
+        extra_binds.push((pw.clone(), pw.clone(), false));
+        // optional hint; harmless if unused
+        set_if_missing(env_pairs, "PIPEWIRE_REMOTE", "pipewire-0".to_string());
+    } else if verbosity > 1 {
+        log_error(&format!(
+            "gui: pipewire socket not found or not a socket at {}",
+            pw.display()
+        ));
+    }
 
     maybe_wrap_dbus_run_session(cmd_vec, verbosity);
     extra_binds
 }
 
-// -------- small helpers --------
+// -------- helpers --------
 
 fn env_has(env: &[(String, String)], k: &str) -> bool {
     env.iter().any(|(ek, _)| ek == k)
@@ -111,6 +128,13 @@ fn set_override(env: &mut Vec<(String, String)>, k: &str, v: String) {
     } else {
         env.push((k.to_string(), v));
     }
+}
+
+fn path_is_socket(p: &Path) -> bool {
+    std::fs::metadata(p)
+        .ok()
+        .map(|m| m.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 /// If dbus-run-session exists and command is not already wrapped, wrap it:

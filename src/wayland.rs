@@ -108,8 +108,10 @@ pub fn find_parent_wayland_socket() -> Option<ParentWayland> {
     let euid = unsafe { libc::geteuid() };
     if euid == 0 {
         let rt0 = PathBuf::from("/run/user/0");
-        if let Some(found) = probe_wayland_runtime(&rt0) {
-            return Some(found);
+        if rt0.is_dir() {
+            if let Some(found) = probe_wayland_runtime(&rt0) {
+                return Some(found);
+            }
         }
     }
 
