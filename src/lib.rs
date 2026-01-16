@@ -236,10 +236,17 @@ pub struct ProcletOpts {
 /// even if they would normally be granted by the kernel.
 ///
 /// We don't fail the sandbox on errors; we just log unexpected ones.
-fn drop_caps_best_effort() {
+fn drop_caps_best_effort(keep_sys_admin: bool) {
     use nix::errno::Errno;
 
-    for cap in 0..=63 {
+    // CAP_SYS_ADMIN is 21 on Linux.
+    const CAP_SYS_ADMIN: u64 = 21;
+
+    for cap in 0..=63u64 {
+        if keep_sys_admin && cap == CAP_SYS_ADMIN {
+            continue;
+        }
+
         let rc = unsafe {
             libc::prctl(
                 libc::PR_CAPBSET_DROP,
@@ -249,17 +256,20 @@ fn drop_caps_best_effort() {
                 0,
             )
         };
+
         if rc != 0 {
             let e = Errno::last();
-            // EINVAL: invalid cap number (past last_cap) → ignore.
-            // EPERM : not permitted to drop this cap    → ignore.
             if e != Errno::EINVAL && e != Errno::EPERM {
                 log_error(&format!("PR_CAPBSET_DROP({cap}) failed: {e}"));
             }
         }
     }
 
-    v3!("capabilities: bounding set cleared (best-effort)");
+    if keep_sys_admin {
+        v3!("capabilities: bounding set cleared (best-effort), kept CAP_SYS_ADMIN for desktop helpers");
+    } else {
+        v3!("capabilities: bounding set cleared (best-effort)");
+    }
 }
 
 fn setup_gpu_shim(opts: &ProcletOpts) -> Result<(), Errno> {
@@ -420,13 +430,21 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
             if host_is_dir {
                 let _ = std::fs::create_dir_all(inside);
-            } else {
-                if let Some(parent) = inside.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Create a placeholder file target (bind-mount will cover it).
-                let _ = OpenOptions::new().create(true).write(true).open(inside);
-            }
+              } else {
+    if let Some(parent) = inside.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // If target exists and is a directory, remove it so we can bind a file/socket here.
+    if let Ok(md) = std::fs::symlink_metadata(inside) {
+        if md.is_dir() {
+            let _ = std::fs::remove_dir_all(inside);
+        }
+    }
+
+    // Create a placeholder file target (bind-mount will cover it).
+    let _ = OpenOptions::new().create(true).write(true).open(inside);
+}
 
             v3!("bind {:?} -> {:?} (ro={})", host, inside, ro);
 
@@ -556,7 +574,9 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
                     // 1) Drop capabilities from the bounding set as much as
                     //    possible *before* any possible setuid()/setgid().
-                    drop_caps_best_effort();
+                    // "desktop mode" (drop_uid set) must allow portal/FUSE helpers to mount.
+                    let keep_sys_admin = opts.drop_uid.is_some();
+                    drop_caps_best_effort(keep_sys_admin);
 
                     // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
                     if let Some(uid) = opts.drop_uid {
