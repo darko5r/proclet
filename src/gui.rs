@@ -1,9 +1,12 @@
 // src/gui.rs
 use crate::{log_error, wayland};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::os::unix::fs::PermissionsExt;
+
+// ---------- low-level helpers ----------
 
 fn is_socket(p: &Path) -> bool {
     std::fs::metadata(p)
@@ -20,8 +23,7 @@ fn target_has_working_socket(p: &Path) -> bool {
     is_socket(p) && socket_is_live(p)
 }
 
-// For file/socket bind targets: create only the parent directory.
-// Never create_dir_all(target) because target is not a directory.
+// For bind targets that are files/sockets: create only the parent directory.
 fn ensure_parent_dir(target: &Path) {
     if let Some(parent) = target.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -41,18 +43,15 @@ fn ensure_socket_bind_target(target: &Path) {
         }
     }
 
-    // Create placeholder file if missing (bind mount will cover it).
     let _ = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(target);
 }
 
-/// Adds a bind mount for a socket if:
-/// - source is a live socket
-/// - target does NOT already have a working socket
-///
-/// It only prepares the target path correctly (parent dirs).
+/// Add a bind mount for a socket if:
+/// - src is a live socket
+/// - dst does NOT already have a working socket
 fn bridge_socket_if_present(
     extra_binds: &mut Vec<(PathBuf, PathBuf, bool)>,
     verbosity: u8,
@@ -82,7 +81,7 @@ fn bridge_socket_if_present(
         return;
     }
 
-    ensure_parent_dir(dst);
+    ensure_socket_bind_target(dst);
 
     if verbosity >= 1 {
         eprintln!(
@@ -96,115 +95,90 @@ fn bridge_socket_if_present(
     extra_binds.push((src.to_path_buf(), dst.to_path_buf(), false));
 }
 
-/// Prepare a “desktop-like” environment when running as root but dropping to a
-/// real user (Chrome/Firefox etc).
-///
-/// Returns extra bind mounts to be applied by the mount namespace code:
-///   (host_path, inside_path, read_only)
-///
-/// Policy:
-/// - Keep XDG_RUNTIME_DIR as /run/user/<uid> for sane DBus + per-user runtime.
-/// - If parent compositor sockets are elsewhere (often /run/user/0), bind-mount the
-///   socket inode into /run/user/<uid>/<socket_name>.
-/// - Best-effort ACL grant so uid can connect.
-/// - Wrap with dbus-run-session (best-effort) to ensure a working session bus.
-pub fn prepare_desktop(
-    env_pairs: &mut Vec<(String, String)>,
-    cmd_vec: &mut Vec<String>,
-    target_uid: u32,
+/// Bind any path if it exists (used for devices like /dev/fuse).
+fn bind_if_exists(
+    extra_binds: &mut Vec<(PathBuf, PathBuf, bool)>,
     verbosity: u8,
-) -> Vec<(PathBuf, PathBuf, bool)> {
-    let mut extra_binds: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
-
-    // Respect explicit user intent.
-    if env_has(env_pairs, "WAYLAND_DISPLAY") || env_has(env_pairs, "DISPLAY") {
-        return extra_binds;
+    label: &str,
+    src: &Path,
+    dst: &Path,
+    read_only: bool,
+) {
+    if !src.exists() {
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: {label}: not present at {}", src.display());
+        }
+        return;
     }
 
-    let target_runtime = PathBuf::from(format!("/run/user/{target_uid}"));
-    set_if_missing(
-        env_pairs,
-        "XDG_RUNTIME_DIR",
-        target_runtime.to_string_lossy().to_string(),
-    );
+    ensure_parent_dir(dst);
 
-    // --- Wayland socket bridging ---
-    let parent = match wayland::find_parent_wayland_socket() {
-        Some(p) => p,
-        None => {
-            if verbosity > 0 {
-                log_error("gui: no live Wayland socket detected; leaving GUI env untouched");
-            }
-            setup_dbus_and_portals(env_pairs, cmd_vec, target_uid, verbosity);
-            return extra_binds;
-        }
-    };
-
-    if parent.runtime_dir == target_runtime {
-        // Already same runtime; just point env to it.
-        wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
-    } else {
-        // Example: /run/user/0/wayland-0 -> /run/user/1000/wayland-0
-        let inside_socket_path = target_runtime.join(&parent.socket_name);
-
-        if verbosity > 0 {
-            log_error(&format!(
-                "gui: wayland: bridging socket {} -> {}",
-                parent.socket_path.display(),
-                inside_socket_path.display()
-            ));
-        }
-
-        if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
-            if verbosity > 0 {
-                log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
-            }
-        }
-
-        // IMPORTANT: ensure correct target type (file) to avoid ENOTDIR
-        ensure_socket_bind_target(&inside_socket_path);
-        extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
-
-        set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
-        set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
-        set_override(
-            env_pairs,
-            "XDG_RUNTIME_DIR",
-            target_runtime.to_string_lossy().to_string(),
+    if verbosity >= 1 {
+        eprintln!(
+            "proclet: gui: {label}: binding {} -> {}",
+            src.display(),
+            dst.display()
         );
     }
 
-    // --- PipeWire / Pulse sockets bridging ---
-    // Use the SAME parent runtime we just detected (not hardcoded /run/user/0).
-    // Only bridge if runtimes differ; if same runtime, everything is already local.
-    if parent.runtime_dir != target_runtime {
-        let parent_rt = parent.runtime_dir.clone();
-
-        // 1) Pulse socket (covers PipeWire-Pulse AND PulseAudio)
-        bridge_socket_if_present(
-            &mut extra_binds,
-            verbosity,
-            "pulse",
-            &parent_rt.join("pulse/native"),
-            &target_runtime.join("pulse/native"),
-        );
-
-        // 2) Native PipeWire socket (optional, but helpful)
-        bridge_socket_if_present(
-            &mut extra_binds,
-            verbosity,
-            "pipewire",
-            &parent_rt.join("pipewire-0"),
-            &target_runtime.join("pipewire-0"),
-        );
-    }
-
-    // Provide a session bus (best-effort).
-    maybe_wrap_dbus_run_session(cmd_vec, verbosity);
-    extra_binds
+    extra_binds.push((src.to_path_buf(), dst.to_path_buf(), read_only));
 }
 
-// -------- helpers --------
+/// Best-effort: ensure /run/user/<uid>/doc exists and is owned by target uid.
+/// This is important because xdg-document-portal mounts a FUSE fs there.
+fn ensure_doc_mountpoint_best_effort(target_uid: u32, target_runtime: &Path, verbosity: u8) {
+    let doc = target_runtime.join("doc");
+
+    // Create directory if missing.
+    if let Err(e) = std::fs::create_dir_all(&doc) {
+        if verbosity >= 1 {
+            log_error(&format!(
+                "gui: portal: failed to create {} (best-effort): {e}",
+                doc.display()
+            ));
+        }
+        return;
+    }
+
+    // If owned by someone else (often root when runtime dirs are weird), try to fix.
+    if let Ok(md) = std::fs::metadata(&doc) {
+        let uid = md.uid();
+        let gid = md.gid();
+
+        if uid != target_uid as u32 {
+            // Best-effort chown to target uid; keep gid unchanged.
+            // Requires proclet to still be privileged at this point (usually true).
+            let status = Command::new("chown")
+                .arg(format!("{target_uid}:{gid}"))
+                .arg(&doc)
+                .status();
+
+            if verbosity >= 1 {
+                match status {
+                    Ok(s) if s.success() => {
+                        eprintln!(
+                            "proclet: gui: portal: ensured {} ownership -> {}",
+                            doc.display(),
+                            target_uid
+                        );
+                    }
+                    Ok(_) | Err(_) => {
+                        log_error(&format!(
+                            "gui: portal: could not chown {} to uid {} (best-effort)",
+                            doc.display(),
+                            target_uid
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Tight-ish perms help (portal will mount over it anyway).
+    let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o700));
+}
+
+// ---------- env helpers ----------
 
 fn env_has(env: &[(String, String)], k: &str) -> bool {
     env.iter().any(|(ek, _)| ek == k)
@@ -255,54 +229,128 @@ fn maybe_wrap_dbus_run_session(cmd_vec: &mut Vec<String>, verbosity: u8) {
     *cmd_vec = wrapped;
 }
 
-fn host_user_bus_path(uid: u32) -> PathBuf {
-    PathBuf::from(format!("/run/user/{uid}/bus"))
-}
+// ---------- main entry ----------
 
-fn has_live_socket(p: &Path) -> bool {
-    is_socket(p) && socket_is_live(p)
-}
-
-/// Prefer the real user session bus when available.
-/// Otherwise fall back to dbus-run-session.
-/// If we must fall back, disable portals to avoid FUSE doc portal failures.
-fn setup_dbus_and_portals(
+/// Prepare a “desktop-like” environment when running as root but dropping to a
+/// real user (Chrome/Firefox etc).
+///
+/// Returns extra bind mounts to be applied by the mount namespace code:
+///   (host_path, inside_path, read_only)
+///
+/// Policy:
+/// - Keep XDG_RUNTIME_DIR as /run/user/<uid> for sane DBus + per-user runtime.
+/// - If parent compositor sockets are elsewhere (often /run/user/0), bind-mount the
+///   socket inode into /run/user/<uid>/<socket_name>.
+/// - Best-effort ACL grant so uid can connect.
+/// - Bind /dev/fuse and ensure /run/user/<uid>/doc exists for xdg-document-portal.
+/// - Wrap with dbus-run-session (best-effort) to ensure a working session bus.
+pub fn prepare_desktop(
     env_pairs: &mut Vec<(String, String)>,
     cmd_vec: &mut Vec<String>,
     target_uid: u32,
     verbosity: u8,
-) {
-    // If caller already set DBUS_SESSION_BUS_ADDRESS explicitly, respect it.
-    if env_has(env_pairs, "DBUS_SESSION_BUS_ADDRESS") {
-        return;
+) -> Vec<(PathBuf, PathBuf, bool)> {
+    let mut extra_binds: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+
+    // Respect explicit user intent: if caller already set GUI display variables,
+    // don't force our own.
+    if env_has(env_pairs, "WAYLAND_DISPLAY") || env_has(env_pairs, "DISPLAY") {
+        return extra_binds;
     }
 
-    let bus = host_user_bus_path(target_uid);
+    let target_runtime = PathBuf::from(format!("/run/user/{target_uid}"));
+    set_if_missing(
+        env_pairs,
+        "XDG_RUNTIME_DIR",
+        target_runtime.to_string_lossy().to_string(),
+    );
 
-    if has_live_socket(&bus) {
-        // Use the real session bus (best integration: KWallet, KDE services, portals).
-        set_if_missing(
+    // --- Wayland socket bridging ---
+    let parent = match wayland::find_parent_wayland_socket() {
+        Some(p) => p,
+        None => {
+            if verbosity > 0 {
+                log_error("gui: no live Wayland socket detected; leaving GUI env untouched");
+            }
+            // Still do dbus-run-session best-effort.
+            maybe_wrap_dbus_run_session(cmd_vec, verbosity);
+            return extra_binds;
+        }
+    };
+
+    if parent.runtime_dir == target_runtime {
+        // Already same runtime; just point env to it.
+        wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
+    } else {
+        // Example: /run/user/0/wayland-0 -> /run/user/1000/wayland-0
+        let inside_socket_path = target_runtime.join(&parent.socket_name);
+
+        if verbosity > 0 {
+            log_error(&format!(
+                "gui: wayland: bridging socket {} -> {}",
+                parent.socket_path.display(),
+                inside_socket_path.display()
+            ));
+        }
+
+        if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
+            if verbosity > 0 {
+                log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
+            }
+        }
+
+        ensure_socket_bind_target(&inside_socket_path);
+        extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
+
+        set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
+        set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
+        set_override(
             env_pairs,
-            "DBUS_SESSION_BUS_ADDRESS",
-            format!("unix:path={}", bus.display()),
+            "XDG_RUNTIME_DIR",
+            target_runtime.to_string_lossy().to_string(),
+        );
+    }
+
+    // --- PipeWire / Pulse sockets bridging ---
+    // Use the SAME parent runtime we just detected (not hardcoded /run/user/0).
+    if parent.runtime_dir != target_runtime {
+        let parent_rt = parent.runtime_dir.clone();
+
+        // Pulse socket covers PipeWire-Pulse AND PulseAudio
+        bridge_socket_if_present(
+            &mut extra_binds,
+            verbosity,
+            "pulse",
+            &parent_rt.join("pulse/native"),
+            &target_runtime.join("pulse/native"),
         );
 
-        // IMPORTANT: don't wrap with dbus-run-session if we're using the real bus.
-        if verbosity >= 1 {
-            log_error(&format!("gui: dbus: using existing user bus at {}", bus.display()));
-        }
-        return;
+        // Native PipeWire socket is optional but helpful
+        bridge_socket_if_present(
+            &mut extra_binds,
+            verbosity,
+            "pipewire",
+            &parent_rt.join("pipewire-0"),
+            &target_runtime.join("pipewire-0"),
+        );
     }
 
-    // No user bus found → fallback: dbus-run-session
-    if verbosity >= 1 {
-        log_error("gui: dbus: no user bus found; falling back to dbus-run-session");
-    }
+    // --- FUSE support for xdg-document-portal ---
+    // A1) Provide /dev/fuse inside the sandbox.
+    bind_if_exists(
+        &mut extra_binds,
+        verbosity,
+        "fuse",
+        Path::new("/dev/fuse"),
+        Path::new("/dev/fuse"),
+        false,
+    );
 
-    // Portals often fail in sandbox-ish environments (doc portal FUSE mount).
-    // Disable portals in fallback mode to avoid noisy failures.
-    set_if_missing(env_pairs, "GTK_USE_PORTAL", "0".to_string());
+    // A2) Ensure the portal mountpoint exists and is writable by the target user.
+    ensure_doc_mountpoint_best_effort(target_uid, &target_runtime, verbosity);
 
+    // Provide a session bus (best-effort).
     maybe_wrap_dbus_run_session(cmd_vec, verbosity);
-}
 
+    extra_binds
+}
