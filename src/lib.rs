@@ -575,30 +575,50 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     // 1) Drop capabilities from the bounding set as much as
                     //    possible *before* any possible setuid()/setgid().
                     // "desktop mode" (drop_uid set) must allow portal/FUSE helpers to mount.
-                    let keep_sys_admin = opts.drop_uid.is_some();
-                    drop_caps_best_effort(keep_sys_admin);
+                    // let keep_sys_admin = opts.drop_uid.is_some();
+                    // drop_caps_best_effort(keep_sys_admin);
+                    
+		    // --- Innermost payload child (will exec the target) ---
 
-                    // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
-                    if let Some(uid) = opts.drop_uid {
-                        let gid = opts.drop_gid.unwrap_or(uid);
-                        v3!("dropping privileges to uid={}, gid={}", uid, gid);
+// 1) Capability hardening.
+//
+// IMPORTANT:
+// In "desktop mode" (drop_uid set), we must NOT drop the capability bounding
+// set. Desktop helpers (xdg-document-portal, gvfsd-fuse, fusermount3) may rely
+// on setuid-root + caps to perform FUSE mounts.
+//
+// Dropping the bounding set here can cause:
+//   fusermount3: mount failed: Permission denied
+if opts.drop_uid.is_some() {
+    v3!("desktop mode: skipping cap bounding-drop (needed for portal/FUSE helpers)");
+} else {
+    drop_caps_best_effort(false);
+}
 
-                        // Clear supplementary groups first.
-                        unsafe {
-                            libc::setgroups(0, std::ptr::null());
-                        }
+// 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
+// This is what makes Chrome run as the real user while still allowing setuid
+// helpers to work when needed.
+if let Some(uid) = opts.drop_uid {
+    let gid = opts.drop_gid.unwrap_or(uid);
+    v3!("dropping privileges to uid={}, gid={}", uid, gid);
 
-                        if unsafe { libc::setgid(gid) } != 0 {
-                            log_error(&format!("setgid({}) failed: {}", gid, Errno::last()));
-                            std::process::exit(127);
-                        }
-                        if unsafe { libc::setuid(uid) } != 0 {
-                            log_error(&format!("setuid({}) failed: {}", uid, Errno::last()));
-                            std::process::exit(127);
-                        }
+    // Clear supplementary groups first.
+    unsafe {
+        libc::setgroups(0, std::ptr::null());
+    }
 
-                        v3!("privilege drop complete");
-                    }
+    if unsafe { libc::setgid(gid) } != 0 {
+        log_error(&format!("setgid({}) failed: {}", gid, Errno::last()));
+        std::process::exit(127);
+    }
+    if unsafe { libc::setuid(uid) } != 0 {
+        log_error(&format!("setuid({}) failed: {}", uid, Errno::last()));
+        std::process::exit(127);
+    }
+
+    v3!("privilege drop complete");
+}
+
 
                     // 3) Apply env rules in the innermost child before exec.
                     if let Err(e) = apply_env(opts) {
