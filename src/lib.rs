@@ -50,7 +50,7 @@ use nix::{
 };
 
 use std::{
-    ffi::CString,
+    ffi::{CStr, CString},
     fs::OpenOptions,
     io,
     path::{Path, PathBuf},
@@ -272,6 +272,45 @@ fn drop_caps_best_effort(keep_sys_admin: bool) {
     }
 }
 
+/// Set primary gid + supplementary groups for the target uid.
+/// This preserves memberships like `video`, `render`, `audio`, etc.
+///
+/// IMPORTANT:
+/// - Do NOT call setgroups(0, NULL) for desktop mode.
+/// - initgroups() reads /etc/group and populates supplementary groups.
+fn apply_target_groups(uid: u32, gid: u32) -> Result<(), Errno> {
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let mut buf = vec![0u8; 16 * 1024];
+
+        let rc = libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        );
+
+        if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+            return Err(Errno::EPERM);
+        }
+
+        // primary gid first
+        if libc::setgid(gid as libc::gid_t) != 0 {
+            return Err(Errno::last());
+        }
+
+        // supplementary groups for that username
+        let name = CStr::from_ptr(pwd.pw_name);
+        if libc::initgroups(name.as_ptr(), gid as libc::gid_t) != 0 {
+            return Err(Errno::last());
+        }
+
+        Ok(())
+    }
+}
+
 fn setup_gpu_shim(opts: &ProcletOpts) -> Result<(), Errno> {
     use std::fs;
     use std::path::PathBuf;
@@ -430,21 +469,21 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
 
             if host_is_dir {
                 let _ = std::fs::create_dir_all(inside);
-              } else {
-    if let Some(parent) = inside.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+            } else {
+                if let Some(parent) = inside.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
 
-    // If target exists and is a directory, remove it so we can bind a file/socket here.
-    if let Ok(md) = std::fs::symlink_metadata(inside) {
-        if md.is_dir() {
-            let _ = std::fs::remove_dir_all(inside);
-        }
-    }
+                // If target exists and is a directory, remove it so we can bind a file/socket here.
+                if let Ok(md) = std::fs::symlink_metadata(inside) {
+                    if md.is_dir() {
+                        let _ = std::fs::remove_dir_all(inside);
+                    }
+                }
 
-    // Create a placeholder file target (bind-mount will cover it).
-    let _ = OpenOptions::new().create(true).write(true).open(inside);
-}
+                // Create a placeholder file target (bind-mount will cover it).
+                let _ = OpenOptions::new().create(true).write(true).open(inside);
+            }
 
             v3!("bind {:?} -> {:?} (ro={})", host, inside, ro);
 
@@ -572,14 +611,6 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                 ForkResult::Child => {
                     // --- Innermost payload child (will exec the target) ---
 
-                    // 1) Drop capabilities from the bounding set as much as
-                    //    possible *before* any possible setuid()/setgid().
-                    // "desktop mode" (drop_uid set) must allow portal/FUSE helpers to mount.
-                    // let keep_sys_admin = opts.drop_uid.is_some();
-                    // drop_caps_best_effort(keep_sys_admin);
-                    
-		    // --- Innermost payload child (will exec the target) ---
-
                     // 1) Capability hardening.
                     //
                     // IMPORTANT:
@@ -590,36 +621,32 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
                     // Dropping the bounding set here can cause:
                     //   fusermount3: mount failed: Permission denied
                     if opts.drop_uid.is_some() {
-                       v3!("desktop mode: skipping cap bounding-drop (needed for portal/FUSE helpers)");
+                        v3!("desktop mode: skipping cap bounding-drop (needed for portal/FUSE helpers)");
                     } else {
-                       drop_caps_best_effort(false);
+                        drop_caps_best_effort(false);
                     }
 
                     // 2) Optional privilege drop: root → unprivileged uid/gid inside the sandbox.
                     // This is what makes Chrome run as the real user while still allowing setuid
                     // helpers to work when needed.
                     if let Some(uid) = opts.drop_uid {
-                       let gid = opts.drop_gid.unwrap_or(uid);
-                       v3!("dropping privileges to uid={}, gid={}", uid, gid);
+    			let gid = opts.drop_gid.unwrap_or(uid);
+    			v3!("dropping privileges to uid={}, gid={}", uid, gid);
 
-                    // Clear supplementary groups first.
-                    unsafe {
-                       libc::setgroups(0, std::ptr::null());
+    	            // Set primary gid + supplementary groups for that user.
+                    if let Err(e) = apply_target_groups(uid, gid) {
+        		log_error(&format!("apply_target_groups(uid={}, gid={}) failed: {}", uid, gid, e));
+        		std::process::exit(127);
                     }
 
-                    if unsafe { libc::setgid(gid) } != 0 {
-                       log_error(&format!("setgid({}) failed: {}", gid, Errno::last()));
-                       std::process::exit(127);
-                    }
+                    // Now drop uid last.
+                    if unsafe { libc::setuid(uid as libc::uid_t) } != 0 {
+        		log_error(&format!("setuid({}) failed: {}", uid, Errno::last()));
+        		std::process::exit(127);
+    	            }
 
-                    if unsafe { libc::setuid(uid) } != 0 {
-                       log_error(&format!("setuid({}) failed: {}", uid, Errno::last()));
-                       std::process::exit(127);
+    			v3!("privilege drop complete");
                     }
-
-                       v3!("privilege drop complete");
-                    }
-
 
                     // 3) Apply env rules in the innermost child before exec.
                     if let Err(e) = apply_env(opts) {

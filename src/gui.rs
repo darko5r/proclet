@@ -1,10 +1,9 @@
 // src/gui.rs
 use crate::{log_error, wayland};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::os::unix::fs::PermissionsExt;
 
 // ---------- low-level helpers ----------
 
@@ -95,7 +94,7 @@ fn bridge_socket_if_present(
     extra_binds.push((src.to_path_buf(), dst.to_path_buf(), false));
 }
 
-/// Bind any path if it exists (used for devices like /dev/fuse).
+/// Bind any path if it exists (used for devices like /dev/fuse or X11 socket dir).
 fn bind_if_exists(
     extra_binds: &mut Vec<(PathBuf, PathBuf, bool)>,
     verbosity: u8,
@@ -111,7 +110,13 @@ fn bind_if_exists(
         return;
     }
 
-    ensure_parent_dir(dst);
+    // Directory bind target must exist (for file binds, ensure_socket_bind_target handles it).
+    if src.is_dir() {
+        let _ = std::fs::create_dir_all(dst);
+    } else {
+        ensure_parent_dir(dst);
+        let _ = std::fs::OpenOptions::new().create(true).write(true).open(dst);
+    }
 
     if verbosity >= 1 {
         eprintln!(
@@ -147,7 +152,6 @@ fn ensure_doc_mountpoint_best_effort(target_uid: u32, target_runtime: &Path, ver
 
         if uid != target_uid as u32 {
             // Best-effort chown to target uid; keep gid unchanged.
-            // Requires proclet to still be privileged at this point (usually true).
             let status = Command::new("chown")
                 .arg(format!("{target_uid}:{gid}"))
                 .arg(&doc)
@@ -178,10 +182,114 @@ fn ensure_doc_mountpoint_best_effort(target_uid: u32, target_runtime: &Path, ver
     let _ = std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o700));
 }
 
+// ---------- ACL helpers (best-effort) ----------
+
+fn have_setfacl() -> bool {
+    Command::new("sh")
+        .args(["-lc", "command -v setfacl >/dev/null 2>&1"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Best-effort ACL grant for a path: allow target_uid to rw.
+/// This avoids needing render/video group membership inside userns.
+fn grant_path_acl_rw_best_effort(target_uid: u32, path: &Path, verbosity: u8, label: &str) {
+    if !path.exists() {
+        return;
+    }
+    if !have_setfacl() {
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: {label}: setfacl not found; skipping ACL grant");
+        }
+        return;
+    }
+
+    // setfacl -m u:<uid>:rw <path>
+    let status = Command::new("setfacl")
+        .args(["-m", &format!("u:{target_uid}:rw")])
+        .arg(path)
+        .status();
+
+    if verbosity >= 2 {
+        match status {
+            Ok(s) if s.success() => {
+                eprintln!(
+                    "proclet: gui: {label}: granted ACL rw for uid {} on {}",
+                    target_uid,
+                    path.display()
+                );
+            }
+            Ok(_) | Err(_) => {
+                // best-effort: don't fail, just log
+                log_error(&format!(
+                    "gui: {label}: could not setfacl rw for uid {} on {} (best-effort)",
+                    target_uid,
+                    path.display()
+                ));
+            }
+        }
+    }
+}
+
+/// Ensure GPU device nodes are accessible to the sandbox user.
+/// We grant ACL rw on render nodes and card nodes (best-effort).
+fn ensure_gpu_access_best_effort(target_uid: u32, verbosity: u8) {
+    let dri = Path::new("/dev/dri");
+    if dri.exists() {
+        // Grant on card* and renderD*
+        if let Ok(rd) = std::fs::read_dir(dri) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                    if name.starts_with("card") || name.starts_with("renderD") {
+                        grant_path_acl_rw_best_effort(target_uid, &p, verbosity, "gpu-acl");
+                    }
+                }
+            }
+        }
+    }
+
+    // NVIDIA device nodes (optional; helps some stacks)
+    for dev in [
+        "/dev/nvidia0",
+        "/dev/nvidiactl",
+        "/dev/nvidia-modeset",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+    ] {
+        grant_path_acl_rw_best_effort(target_uid, Path::new(dev), verbosity, "gpu-acl");
+    }
+
+    // NVIDIA caps are often restrictive; if present, try to grant read too.
+    // (If this fails, it’s still best-effort.)
+    let nvcaps = Path::new("/dev/nvidia-caps");
+    if nvcaps.exists() {
+        if let Ok(rd) = std::fs::read_dir(nvcaps) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                grant_path_acl_rw_best_effort(target_uid, &p, verbosity, "gpu-acl");
+            }
+        }
+    }
+}
+
 // ---------- env helpers ----------
 
 fn env_has(env: &[(String, String)], k: &str) -> bool {
     env.iter().any(|(ek, _)| ek == k)
+}
+
+fn env_get(env: &[(String, String)], k: &str) -> Option<String> {
+    env.iter().find(|(ek, _)| ek == k).map(|(_, v)| v.clone())
+}
+
+fn env_effective_has(env: &[(String, String)], k: &str) -> bool {
+    env_has(env, k) || std::env::var(k).ok().filter(|v| !v.is_empty()).is_some()
+}
+
+fn env_effective_get(env: &[(String, String)], k: &str) -> Option<String> {
+    env_get(env, k).or_else(|| std::env::var(k).ok())
 }
 
 fn set_if_missing(env: &mut Vec<(String, String)>, k: &str, v: String) {
@@ -229,6 +337,86 @@ fn maybe_wrap_dbus_run_session(cmd_vec: &mut Vec<String>, verbosity: u8) {
     *cmd_vec = wrapped;
 }
 
+// ---------- EGL vendor pinning (GLVND) ----------
+
+fn maybe_pin_egl_vendor(env_pairs: &mut Vec<(String, String)>, verbosity: u8) {
+    // User override:
+    //   PROCLET_EGL_VENDOR=auto|nvidia|mesa|none
+    // default = auto
+    let mode = std::env::var("PROCLET_EGL_VENDOR").unwrap_or_else(|_| "auto".to_string());
+    let mode = mode.to_lowercase();
+
+    if mode == "none" {
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: egl: vendor pinning disabled (PROCLET_EGL_VENDOR=none)");
+        }
+        return;
+    }
+
+    // If caller already set __EGL_VENDOR_LIBRARY_FILENAMES explicitly, respect it.
+    if env_effective_has(env_pairs, "__EGL_VENDOR_LIBRARY_FILENAMES") {
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: egl: respecting existing __EGL_VENDOR_LIBRARY_FILENAMES");
+        }
+        return;
+    }
+
+    let nvidia_json = Path::new("/usr/share/glvnd/egl_vendor.d/10_nvidia.json");
+    let mesa_json = Path::new("/usr/share/glvnd/egl_vendor.d/50_mesa.json");
+    let have_nvidia_dev = Path::new("/dev/nvidia0").exists();
+
+    match mode.as_str() {
+        "nvidia" => {
+            if nvidia_json.exists() {
+                set_override(
+                    env_pairs,
+                    "__EGL_VENDOR_LIBRARY_FILENAMES",
+                    nvidia_json.to_string_lossy().to_string(),
+                );
+                // GLX too, just to keep it consistent.
+                set_if_missing(env_pairs, "__GLX_VENDOR_LIBRARY_NAME", "nvidia".to_string());
+                if verbosity >= 1 {
+                    eprintln!("proclet: gui: egl: pinned vendor -> {}", nvidia_json.display());
+                }
+            } else if verbosity >= 1 {
+                log_error("gui: egl: requested NVIDIA vendor pin but 10_nvidia.json not found");
+            }
+        }
+        "mesa" => {
+            if mesa_json.exists() {
+                set_override(
+                    env_pairs,
+                    "__EGL_VENDOR_LIBRARY_FILENAMES",
+                    mesa_json.to_string_lossy().to_string(),
+                );
+                if verbosity >= 1 {
+                    eprintln!("proclet: gui: egl: pinned vendor -> {}", mesa_json.display());
+                }
+            } else if verbosity >= 1 {
+                log_error("gui: egl: requested Mesa vendor pin but 50_mesa.json not found");
+            }
+        }
+        // auto
+        _ => {
+            // Only pin to NVIDIA in auto mode when it clearly exists.
+            if have_nvidia_dev && nvidia_json.exists() {
+                set_override(
+                    env_pairs,
+                    "__EGL_VENDOR_LIBRARY_FILENAMES",
+                    nvidia_json.to_string_lossy().to_string(),
+                );
+                set_if_missing(env_pairs, "__GLX_VENDOR_LIBRARY_NAME", "nvidia".to_string());
+                if verbosity >= 1 {
+                    eprintln!(
+                        "proclet: gui: egl: auto-pinned vendor -> {}",
+                        nvidia_json.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 // ---------- main entry ----------
 
 /// Prepare a “desktop-like” environment when running as root but dropping to a
@@ -239,11 +427,12 @@ fn maybe_wrap_dbus_run_session(cmd_vec: &mut Vec<String>, verbosity: u8) {
 ///
 /// Policy:
 /// - Keep XDG_RUNTIME_DIR as /run/user/<uid> for sane DBus + per-user runtime.
-/// - If parent compositor sockets are elsewhere (often /run/user/0), bind-mount the
-///   socket inode into /run/user/<uid>/<socket_name>.
-/// - Best-effort ACL grant so uid can connect.
+/// - Wayland-first: if parent Wayland socket exists, bridge it.
+/// - If no Wayland socket exists: if DISPLAY exists, bridge X11 (/tmp/.X11-unix) and XAUTHORITY if present.
 /// - Bind /dev/fuse and ensure /run/user/<uid>/doc exists for xdg-document-portal.
+/// - Bind GPU nodes (/dev/dri + /dev/nvidia*) and grant best-effort ACL so EGL works.
 /// - Wrap with dbus-run-session (best-effort) to ensure a working session bus.
+/// - Pin EGL vendor (GLVND) to NVIDIA when appropriate (reduces libEGL/Mesa probe spam).
 pub fn prepare_desktop(
     env_pairs: &mut Vec<(String, String)>,
     cmd_vec: &mut Vec<String>,
@@ -252,12 +441,6 @@ pub fn prepare_desktop(
 ) -> Vec<(PathBuf, PathBuf, bool)> {
     let mut extra_binds: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
 
-    // Respect explicit user intent: if caller already set GUI display variables,
-    // don't force our own.
-    if env_has(env_pairs, "WAYLAND_DISPLAY") || env_has(env_pairs, "DISPLAY") {
-        return extra_binds;
-    }
-
     let target_runtime = PathBuf::from(format!("/run/user/{target_uid}"));
     set_if_missing(
         env_pairs,
@@ -265,78 +448,110 @@ pub fn prepare_desktop(
         target_runtime.to_string_lossy().to_string(),
     );
 
-    // --- Wayland socket bridging ---
-    let parent = match wayland::find_parent_wayland_socket() {
-        Some(p) => p,
-        None => {
-            if verbosity > 0 {
-                log_error("gui: no live Wayland socket detected; leaving GUI env untouched");
-            }
-            // Still do dbus-run-session best-effort.
-            maybe_wrap_dbus_run_session(cmd_vec, verbosity);
-            return extra_binds;
-        }
-    };
+    // Pin EGL vendor early (pure env change).
+    maybe_pin_egl_vendor(env_pairs, verbosity);
 
-    if parent.runtime_dir == target_runtime {
-        // Already same runtime; just point env to it.
-        wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
+    // --- Wayland socket bridging (Wayland-first) ---
+    let parent_wayland = wayland::find_parent_wayland_socket();
+
+    if let Some(parent) = parent_wayland {
+        // If parent runtime differs, bind the socket inode into target runtime.
+        if parent.runtime_dir == target_runtime {
+            // Already same runtime; just ensure env points at it if caller didn't specify.
+            if !env_effective_has(env_pairs, "WAYLAND_DISPLAY") {
+                wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
+            }
+        } else {
+            let inside_socket_path = target_runtime.join(&parent.socket_name);
+
+            if verbosity > 0 {
+                eprintln!(
+                    "proclet: gui: wayland: bridging socket {} -> {}",
+                    parent.socket_path.display(),
+                    inside_socket_path.display()
+                );
+            }
+
+            if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
+                if verbosity > 0 {
+                    log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
+                }
+            }
+
+            ensure_socket_bind_target(&inside_socket_path);
+            extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
+
+            // Do NOT stomp caller-provided values; only set if missing.
+            set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
+            set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
+            set_override(
+                env_pairs,
+                "XDG_RUNTIME_DIR",
+                target_runtime.to_string_lossy().to_string(),
+            );
+        }
+
+        // --- PipeWire / Pulse sockets bridging ---
+        if parent.runtime_dir != target_runtime {
+            let parent_rt = parent.runtime_dir.clone();
+
+            bridge_socket_if_present(
+                &mut extra_binds,
+                verbosity,
+                "pulse",
+                &parent_rt.join("pulse/native"),
+                &target_runtime.join("pulse/native"),
+            );
+
+            bridge_socket_if_present(
+                &mut extra_binds,
+                verbosity,
+                "pipewire",
+                &parent_rt.join("pipewire-0"),
+                &target_runtime.join("pipewire-0"),
+            );
+        }
     } else {
-        // Example: /run/user/0/wayland-0 -> /run/user/1000/wayland-0
-        let inside_socket_path = target_runtime.join(&parent.socket_name);
+        // --- X11 fallback (only if DISPLAY exists) ---
+        if env_effective_has(env_pairs, "DISPLAY") {
+            // Bind /tmp/.X11-unix directory (X11 socket dir)
+            bind_if_exists(
+                &mut extra_binds,
+                verbosity,
+                "x11",
+                Path::new("/tmp/.X11-unix"),
+                Path::new("/tmp/.X11-unix"),
+                false,
+            );
 
-        if verbosity > 0 {
-            log_error(&format!(
-                "gui: wayland: bridging socket {} -> {}",
-                parent.socket_path.display(),
-                inside_socket_path.display()
-            ));
-        }
-
-        if let Err(e) = wayland::grant_wayland_acl_best_effort(target_uid, &parent) {
-            if verbosity > 0 {
-                log_error(&format!("gui: wayland ACL grant failed (best-effort): {e}"));
+            // Bind XAUTHORITY file if present (don’t force it; just support it).
+            if let Some(xauth) = env_effective_get(env_pairs, "XAUTHORITY") {
+                let xauth_path = PathBuf::from(xauth);
+                if xauth_path.exists() {
+                    bind_if_exists(
+                        &mut extra_binds,
+                        verbosity,
+                        "x11-xauth",
+                        &xauth_path,
+                        &xauth_path,
+                        true,
+                    );
+                } else if verbosity >= 2 {
+                    eprintln!(
+                        "proclet: gui: x11-xauth: XAUTHORITY points to missing file: {}",
+                        xauth_path.display()
+                    );
+                }
             }
+
+            // We explicitly do NOT set DISPLAY here.
+            // If the host/inherited environment has DISPLAY, the payload will see it.
+        } else if verbosity > 0 {
+            log_error("gui: no live Wayland socket detected and no DISPLAY present; leaving GUI env untouched");
         }
-
-        ensure_socket_bind_target(&inside_socket_path);
-        extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
-
-        set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
-        set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
-        set_override(
-            env_pairs,
-            "XDG_RUNTIME_DIR",
-            target_runtime.to_string_lossy().to_string(),
-        );
-    }
-
-    // --- PipeWire / Pulse sockets bridging ---
-    // Use the SAME parent runtime we just detected (not hardcoded /run/user/0).
-    if parent.runtime_dir != target_runtime {
-        let parent_rt = parent.runtime_dir.clone();
-
-        // Pulse socket covers PipeWire-Pulse AND PulseAudio
-        bridge_socket_if_present(
-            &mut extra_binds,
-            verbosity,
-            "pulse",
-            &parent_rt.join("pulse/native"),
-            &target_runtime.join("pulse/native"),
-        );
-
-        // Native PipeWire socket is optional but helpful
-        bridge_socket_if_present(
-            &mut extra_binds,
-            verbosity,
-            "pipewire",
-            &parent_rt.join("pipewire-0"),
-            &target_runtime.join("pipewire-0"),
-        );
     }
 
     // --- FUSE support for xdg-document-portal ---
-    // A1) Provide /dev/fuse inside the sandbox.
     bind_if_exists(
         &mut extra_binds,
         verbosity,
@@ -346,8 +561,55 @@ pub fn prepare_desktop(
         false,
     );
 
-    // A2) Ensure the portal mountpoint exists and is writable by the target user.
     ensure_doc_mountpoint_best_effort(target_uid, &target_runtime, verbosity);
+
+    // --- GPU integration (EGL/GBM/DRM) ---
+    // Bind GPU nodes and grant best-effort ACL so sandbox user can open them,
+    // even if supplementary groups are not preserved inside the user namespace.
+    //
+    // You can disable this with: PROCLET_GPU=0
+    let gpu_mode = std::env::var("PROCLET_GPU").unwrap_or_else(|_| "1".to_string());
+    if gpu_mode != "0" {
+        bind_if_exists(
+            &mut extra_binds,
+            verbosity,
+            "dri",
+            Path::new("/dev/dri"),
+            Path::new("/dev/dri"),
+            false,
+        );
+
+        // Optional NVIDIA nodes (best-effort)
+        for dev in [
+            "/dev/nvidia0",
+            "/dev/nvidiactl",
+            "/dev/nvidia-modeset",
+            "/dev/nvidia-uvm",
+            "/dev/nvidia-uvm-tools",
+        ] {
+            bind_if_exists(
+                &mut extra_binds,
+                verbosity,
+                "nvidia",
+                Path::new(dev),
+                Path::new(dev),
+                false,
+            );
+        }
+        bind_if_exists(
+            &mut extra_binds,
+            verbosity,
+            "nvidia-caps",
+            Path::new("/dev/nvidia-caps"),
+            Path::new("/dev/nvidia-caps"),
+            false,
+        );
+
+        // ACL grants are best-effort and safe: they only widen access for the target uid.
+        ensure_gpu_access_best_effort(target_uid, verbosity);
+    } else if verbosity >= 2 {
+        eprintln!("proclet: gui: gpu: disabled (PROCLET_GPU=0)");
+    }
 
     // Provide a session bus (best-effort).
     maybe_wrap_dbus_run_session(cmd_vec, verbosity);
