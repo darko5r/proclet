@@ -1,9 +1,17 @@
 // src/gui.rs
 use crate::{log_error, wayland};
+use libc;
+use nix::errno::Errno;
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use std::os::unix::ffi::OsStrExt;
 
 // ---------- low-level helpers ----------
 
@@ -58,6 +66,13 @@ fn bridge_socket_if_present(
     src: &Path,
     dst: &Path,
 ) {
+
+        if src == dst {
+        // No-op: same path
+        return;
+    }
+    
+
     // If destination already works, don't touch it.
     if target_has_working_socket(dst) {
         if verbosity >= 1 {
@@ -150,7 +165,7 @@ fn ensure_doc_mountpoint_best_effort(target_uid: u32, target_runtime: &Path, ver
         let uid = md.uid();
         let gid = md.gid();
 
-        if uid != target_uid as u32 {
+        if uid != target_uid {
             // Best-effort chown to target uid; keep gid unchanged.
             let status = Command::new("chown")
                 .arg(format!("{target_uid}:{gid}"))
@@ -262,7 +277,6 @@ fn ensure_gpu_access_best_effort(target_uid: u32, verbosity: u8) {
     }
 
     // NVIDIA caps are often restrictive; if present, try to grant read too.
-    // (If this fails, it’s still best-effort.)
     let nvcaps = Path::new("/dev/nvidia-caps");
     if nvcaps.exists() {
         if let Ok(rd) = std::fs::read_dir(nvcaps) {
@@ -335,6 +349,317 @@ fn maybe_wrap_dbus_run_session(cmd_vec: &mut Vec<String>, verbosity: u8) {
     wrapped.push("--".to_string());
     wrapped.extend(cmd_vec.drain(..));
     *cmd_vec = wrapped;
+}
+
+// ---------- Desktop-bus spawn support (stable user DBus even if root has none) ----------
+
+static DESKTOP_BUS_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {name} >/dev/null 2>&1")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn kill_desktop_bus_best_effort(verbosity: u8) {
+    let mut guard = DESKTOP_BUS_CHILD.lock().unwrap();
+    if let Some(mut child) = guard.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: dbus: stopped spawned desktop bus");
+        }
+    }
+}
+
+/// Ensure /run/user/<uid> exists, mode=0700, owned by uid:gid (best-effort).
+fn ensure_user_runtime_dir(uid: u32, gid: u32, verbosity: u8) -> std::io::Result<PathBuf> {
+    let rt = PathBuf::from(format!("/run/user/{uid}"));
+    std::fs::create_dir_all(&rt)?;
+    let _ = std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700));
+
+    // Best-effort: chown it. (Root should succeed; if not, we still try.)
+    let cpath = CString::new(rt.as_os_str().as_bytes()).unwrap();
+    unsafe {
+        if libc::chown(cpath.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) != 0 {
+            if verbosity >= 1 {
+                log_error(&format!(
+                    "gui: dbus: could not chown {} to {}:{} (best-effort): {}",
+                    rt.display(),
+                    uid,
+                    gid,
+                    Errno::last()
+                ));
+            }
+        }
+    }
+
+    Ok(rt)
+}
+
+/// Spawn a real session bus for uid, bound to /run/user/<uid>/bus and kept alive
+/// for the lifetime of proclet (caller must call cleanup after payload exits).
+///
+/// Prefers dbus-broker-launch if present; otherwise falls back to dbus-daemon.
+/// Returns the address to use in DBUS_SESSION_BUS_ADDRESS (unix:path=...).
+fn spawn_user_dbus_at_runtime(uid: u32, gid: u32, verbosity: u8) -> Option<String> {
+    let rt = ensure_user_runtime_dir(uid, gid, verbosity).ok()?;
+    let bus_path = rt.join("bus");
+
+    // If it already exists and is live, reuse it.
+    if target_has_working_socket(&bus_path) {
+        if verbosity >= 2 {
+            eprintln!("proclet: gui: dbus: target bus already live at {}", bus_path.display());
+        }
+        return Some(format!("unix:path={}", bus_path.display()));
+    }
+
+    // Remove stale non-socket target.
+    if let Ok(md) = std::fs::symlink_metadata(&bus_path) {
+        if !md.file_type().is_socket() {
+            let _ = std::fs::remove_file(&bus_path);
+        }
+    }
+
+    let have_broker = command_exists("dbus-broker-launch");
+    let have_daemon = command_exists("dbus-daemon");
+
+    if !have_broker && !have_daemon {
+        if verbosity >= 1 {
+            log_error("gui: dbus: neither dbus-broker-launch nor dbus-daemon found; cannot spawn bus");
+        }
+        return None;
+    }
+
+    let addr = format!("unix:path={}", bus_path.display());
+
+    let mut cmd = if have_broker {
+        let mut c = Command::new("dbus-broker-launch");
+        c.args(["--scope", "user", "--address", &addr]);
+        c
+    } else {
+        let mut c = Command::new("dbus-daemon");
+        c.args(["--session", "--nofork", "--nopidfile", "--address", &addr]);
+        c
+    };
+
+    // Make it behave like a user bus.
+    cmd.env("XDG_RUNTIME_DIR", rt.to_string_lossy().to_string());
+    cmd.env_remove("DBUS_SESSION_BUS_ADDRESS");
+
+    // Run it as the target uid (important: ownership & EXTERNAL auth expectations).
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setgroups(0, std::ptr::null());
+
+            if libc::setgid(gid as libc::gid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(uid as libc::uid_t) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            if verbosity >= 1 {
+                log_error(&format!("gui: dbus: failed to spawn session bus: {e}"));
+            }
+            return None;
+        }
+    };
+
+    {
+        let mut guard = DESKTOP_BUS_CHILD.lock().unwrap();
+        *guard = Some(child);
+    }
+
+    // Wait briefly for bus socket to come alive.
+    let start = Instant::now();
+    let deadline = Duration::from_millis(900);
+    while start.elapsed() < deadline {
+        if target_has_working_socket(&bus_path) {
+            if verbosity >= 1 {
+                eprintln!(
+                    "proclet: gui: dbus: spawned session bus at {}",
+                    bus_path.display()
+                );
+            }
+            return Some(addr);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    if verbosity >= 1 {
+        log_error(&format!(
+            "gui: dbus: spawned bus but socket did not become live at {} (best-effort)",
+            bus_path.display()
+        ));
+    }
+
+    kill_desktop_bus_best_effort(verbosity);
+    None
+}
+
+/// Call this after payload exit to avoid leaving broker/daemon alive.
+pub fn cleanup_desktop_bus(verbosity: u8) {
+    kill_desktop_bus_best_effort(verbosity);
+}
+
+// ---------- DBus discovery (KDE/session bus) ----------
+
+fn read_to_string_best_effort(p: &Path) -> Option<String> {
+    std::fs::read_to_string(p).ok()
+}
+
+fn parse_proc_uid_from_status(status: &str) -> Option<u32> {
+    // Format:
+    // Uid:    1000    1000    1000    1000
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            let mut it = rest.split_whitespace();
+            if let Some(uid) = it.next() {
+                return uid.parse::<u32>().ok();
+            }
+        }
+    }
+    None
+}
+
+fn proc_pid_uid(pid: i32) -> Option<u32> {
+    let p = PathBuf::from(format!("/proc/{pid}/status"));
+    let s = read_to_string_best_effort(&p)?;
+    parse_proc_uid_from_status(&s)
+}
+
+fn proc_pid_comm(pid: i32) -> Option<String> {
+    let p = PathBuf::from(format!("/proc/{pid}/comm"));
+    let s = read_to_string_best_effort(&p)?;
+    Some(s.trim().to_string())
+}
+
+fn proc_pid_environ(pid: i32) -> Option<HashMap<String, String>> {
+    let p = PathBuf::from(format!("/proc/{pid}/environ"));
+    let bytes = std::fs::read(p).ok()?;
+    let mut env = HashMap::new();
+
+    for part in bytes.split(|b| *b == 0u8) {
+        if part.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(part);
+        if let Some((k, v)) = s.split_once('=') {
+            env.insert(k.to_string(), v.to_string());
+        }
+    }
+    Some(env)
+}
+
+fn primary_gid_for_uid(uid: u32) -> Option<u32> {
+    // Use libc getpwuid_r (works even with NSS; doesn’t assume /etc/passwd only).
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+        // Reasonable buffer for NSS backends
+        let mut buf = vec![0u8; 16 * 1024];
+
+        let rc = libc::getpwuid_r(
+            uid as libc::uid_t,
+            &mut pwd as *mut _,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result as *mut _,
+        );
+
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+
+        Some(pwd.pw_gid as u32)
+    }
+}
+
+/// Find the latest PID (best-effort) of a process owned by `uid` whose comm matches any of `names`.
+/// IMPORTANT: /proc is racy — we must not abort the search on a single unreadable entry.
+fn find_latest_pid_by_comm(uid: u32, names: &[&str]) -> Option<i32> {
+    let rd = std::fs::read_dir("/proc").ok()?;
+    let mut best: Option<i32> = None;
+
+    for ent in rd.flatten() {
+        let file_name = ent.file_name();
+        let s = file_name.to_string_lossy();
+        let pid: i32 = match s.parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match proc_pid_uid(pid) {
+            Some(puid) if puid == uid => {}
+            _ => continue,
+        }
+
+        let comm = match proc_pid_comm(pid) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        if !names.iter().any(|n| *n == comm) {
+            continue;
+        }
+
+        best = match best {
+            None => Some(pid),
+            Some(cur) => Some(cur.max(pid)),
+        };
+    }
+
+    best
+}
+
+fn dbus_unix_path_from_addr(addr: &str) -> Option<PathBuf> {
+    // We only handle bind-mountable form:
+    //   unix:path=/some/socket[,guid=...]
+    // Also allow: unix:path=/some/socket;guid=...
+    let s = addr.trim();
+    let s = s.strip_prefix("unix:")?;
+    for chunk in s.split(&[',', ';'][..]) {
+        let chunk = chunk.trim();
+        if let Some(p) = chunk.strip_prefix("path=") {
+            if !p.is_empty() {
+                return Some(PathBuf::from(p));
+            }
+        }
+    }
+    None
+}
+
+fn discover_kde_session_bus(uid: u32) -> Option<String> {
+    // Priority order: session core -> shell -> compositor -> helpers
+    let candidates: [&[&str]; 4] = [
+        &["ksmserver"],
+        &["plasmashell"],
+        &["kwin_wayland", "kwin_x11"],
+        &["kded6", "klauncher", "startplasma-wayland", "startplasma-x11"],
+    ];
+
+    for names in candidates {
+        if let Some(pid) = find_latest_pid_by_comm(uid, names) {
+            if let Some(env) = proc_pid_environ(pid) {
+                if let Some(addr) = env.get("DBUS_SESSION_BUS_ADDRESS") {
+                    if !addr.trim().is_empty() {
+                        return Some(addr.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---------- EGL vendor pinning (GLVND) ----------
@@ -431,7 +756,11 @@ fn maybe_pin_egl_vendor(env_pairs: &mut Vec<(String, String)>, verbosity: u8) {
 /// - If no Wayland socket exists: if DISPLAY exists, bridge X11 (/tmp/.X11-unix) and XAUTHORITY if present.
 /// - Bind /dev/fuse and ensure /run/user/<uid>/doc exists for xdg-document-portal.
 /// - Bind GPU nodes (/dev/dri + /dev/nvidia*) and grant best-effort ACL so EGL works.
-/// - Wrap with dbus-run-session (best-effort) to ensure a working session bus.
+/// - DBus:
+///   - In root->user "emulation" mode, do NOT trust caller-provided DBUS_SESSION_BUS_ADDRESS.
+///     Prefer discovering the target user's real session bus, then /run/user/<uid>/bus.
+///   - Optionally spawn a user bus at /run/user/<uid>/bus (PROCLET_DBUS=spawn).
+///   - Fallback: dbus-run-session.
 /// - Pin EGL vendor (GLVND) to NVIDIA when appropriate (reduces libEGL/Mesa probe spam).
 pub fn prepare_desktop(
     env_pairs: &mut Vec<(String, String)>,
@@ -441,12 +770,158 @@ pub fn prepare_desktop(
 ) -> Vec<(PathBuf, PathBuf, bool)> {
     let mut extra_binds: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
 
+    // ---- runtime dir (always sane) ----
     let target_runtime = PathBuf::from(format!("/run/user/{target_uid}"));
     set_if_missing(
         env_pairs,
         "XDG_RUNTIME_DIR",
         target_runtime.to_string_lossy().to_string(),
     );
+
+    // ---- KDE / Plasma identity (helps Chrome pick kwalletd6 + correct portal paths) ----
+    // Only set if missing, so we don't stomp on explicit user configs.
+    set_if_missing(env_pairs, "XDG_CURRENT_DESKTOP", "KDE".to_string());
+    set_if_missing(env_pairs, "XDG_SESSION_DESKTOP", "KDE".to_string());
+    set_if_missing(env_pairs, "DESKTOP_SESSION", "plasma".to_string());
+    set_if_missing(env_pairs, "KDE_FULL_SESSION", "true".to_string());
+    set_if_missing(env_pairs, "KDE_SESSION_VERSION", "6".to_string());
+
+    // ---- DBus session handling ----
+    //
+    // Modes:
+    //   PROCLET_DBUS=auto|discover|host|spawn|session|inherit
+    //
+    // auto (default):
+    //   1) discover KDE session bus from target user process env
+    //   2) /run/user/<uid>/bus
+    //   3) (only if NOT switching user) use caller bus
+    //   4) dbus-run-session
+    //
+    // spawn:
+    //   If /run/user/<uid>/bus is missing, create /run/user/<uid> and spawn a real user bus there.
+    //
+    // session:
+    //   always force dbus-run-session
+    let dbus_mode = std::env::var("PROCLET_DBUS")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_lowercase();
+
+    if dbus_mode == "session" {
+        maybe_wrap_dbus_run_session(cmd_vec, verbosity);
+        if verbosity >= 1 {
+            eprintln!("proclet: gui: dbus: forced dbus-run-session (PROCLET_DBUS=session)");
+        }
+    } else {
+        let caller_uid = unsafe { libc::geteuid() as u32 };
+        let switching_user = caller_uid != target_uid;
+
+        let caller_bus = env_effective_get(env_pairs, "DBUS_SESSION_BUS_ADDRESS")
+            .filter(|v| !v.trim().is_empty());
+
+        let mut decided_bus: Option<String> = None;
+
+        // 1) Explicit inherit: trust caller env even if switching user.
+        if dbus_mode == "inherit" {
+            if let Some(v) = &caller_bus {
+                decided_bus = Some(v.clone());
+                if verbosity >= 1 {
+                    eprintln!("proclet: gui: dbus: forced inherit of caller DBUS_SESSION_BUS_ADDRESS");
+                }
+            } else if verbosity >= 1 {
+                log_error("gui: dbus: PROCLET_DBUS=inherit but caller DBUS_SESSION_BUS_ADDRESS is empty");
+            }
+        }
+
+        // 2) Discover KDE bus from target user's existing desktop session processes.
+        if decided_bus.is_none() && (dbus_mode == "auto" || dbus_mode == "discover") {
+            if let Some(addr) = discover_kde_session_bus(target_uid) {
+                decided_bus = Some(addr);
+                if verbosity >= 1 {
+                    eprintln!("proclet: gui: dbus: discovered KDE session bus from user process env");
+                }
+            } else if verbosity >= 2 {
+                eprintln!("proclet: gui: dbus: KDE session bus discovery failed");
+            }
+        }
+
+        // 3) Host bus socket: /run/user/<uid>/bus (systemd user bus), optionally spawn it.
+        if decided_bus.is_none()
+            && (dbus_mode == "auto" || dbus_mode == "host" || dbus_mode == "spawn")
+        {
+            let host_bus = PathBuf::from(format!("/run/user/{target_uid}/bus"));
+
+            if target_has_working_socket(&host_bus) {
+                let inside_bus = target_runtime.join("bus");
+                bridge_socket_if_present(&mut extra_binds, verbosity, "dbus", &host_bus, &inside_bus);
+                decided_bus = Some(format!("unix:path={}", inside_bus.display()));
+
+                if verbosity >= 1 {
+                    eprintln!(
+                        "proclet: gui: dbus: using target user bus via {}",
+                        inside_bus.display()
+                    );
+                }
+            } else {
+                if verbosity >= 2 {
+                    eprintln!(
+                        "proclet: gui: dbus: no usable /run/user/{}/bus socket",
+                        target_uid
+                    );
+                }
+
+                if dbus_mode == "spawn" {
+                    // Best-effort gid: use uid (common when gid==uid), but you can wire real gid later.
+                    let target_gid = primary_gid_for_uid(target_uid).unwrap_or(target_uid);
+			if let Some(addr) = spawn_user_dbus_at_runtime(target_uid, target_gid, verbosity) {
+    			decided_bus = Some(addr);
+		    }
+                }
+            }
+        }
+
+        // 4) Only when NOT switching users in auto mode: accept caller bus as a fallback.
+        if decided_bus.is_none() && dbus_mode == "auto" && !switching_user {
+            if let Some(v) = &caller_bus {
+                decided_bus = Some(v.clone());
+                if verbosity >= 1 {
+                    eprintln!("proclet: gui: dbus: using caller DBUS_SESSION_BUS_ADDRESS (same uid)");
+                }
+            }
+        }
+
+        // Apply decision (or fallback to dbus-run-session).
+        if let Some(addr) = decided_bus {
+            if let Some(src_path) = dbus_unix_path_from_addr(&addr) {
+                let run_user_prefix = PathBuf::from(format!("/run/user/{target_uid}/"));
+                if src_path.starts_with(&run_user_prefix) {
+                    if let Ok(rel) = src_path.strip_prefix(&run_user_prefix) {
+                        let dst_path = target_runtime.join(rel);
+                        bridge_socket_if_present(&mut extra_binds, verbosity, "dbus", &src_path, &dst_path);
+                        set_override(
+                            env_pairs,
+                            "DBUS_SESSION_BUS_ADDRESS",
+                            format!("unix:path={}", dst_path.display()),
+                        );
+                    } else {
+                        set_override(env_pairs, "DBUS_SESSION_BUS_ADDRESS", addr);
+                    }
+                } else {
+                    set_override(env_pairs, "DBUS_SESSION_BUS_ADDRESS", addr);
+                }
+            } else {
+                set_override(env_pairs, "DBUS_SESSION_BUS_ADDRESS", addr);
+            }
+
+            if verbosity >= 2 {
+                eprintln!("proclet: gui: dbus: using existing/discovered DBUS_SESSION_BUS_ADDRESS (no dbus-run-session)");
+            }
+        } else {
+            maybe_wrap_dbus_run_session(cmd_vec, verbosity);
+            if verbosity >= 1 {
+                eprintln!("proclet: gui: dbus: no usable target bus; using dbus-run-session");
+            }
+        }
+    }
 
     // Pin EGL vendor early (pure env change).
     maybe_pin_egl_vendor(env_pairs, verbosity);
@@ -457,7 +932,6 @@ pub fn prepare_desktop(
     if let Some(parent) = parent_wayland {
         // If parent runtime differs, bind the socket inode into target runtime.
         if parent.runtime_dir == target_runtime {
-            // Already same runtime; just ensure env points at it if caller didn't specify.
             if !env_effective_has(env_pairs, "WAYLAND_DISPLAY") {
                 wayland::ensure_env_points_to_parent_socket(env_pairs, &parent);
             }
@@ -481,7 +955,6 @@ pub fn prepare_desktop(
             ensure_socket_bind_target(&inside_socket_path);
             extra_binds.push((parent.socket_path.clone(), inside_socket_path.clone(), false));
 
-            // Do NOT stomp caller-provided values; only set if missing.
             set_if_missing(env_pairs, "WAYLAND_DISPLAY", parent.socket_name.clone());
             set_if_missing(env_pairs, "XDG_SESSION_TYPE", "wayland".to_string());
             set_override(
@@ -492,29 +965,47 @@ pub fn prepare_desktop(
         }
 
         // --- PipeWire / Pulse sockets bridging ---
-        if parent.runtime_dir != target_runtime {
-            let parent_rt = parent.runtime_dir.clone();
+        {
+            let target_pulse = target_runtime.join("pulse/native");
+            let target_pw = target_runtime.join("pipewire-0");
 
-            bridge_socket_if_present(
-                &mut extra_binds,
-                verbosity,
-                "pulse",
-                &parent_rt.join("pulse/native"),
-                &target_runtime.join("pulse/native"),
-            );
+            if parent.runtime_dir != target_runtime {
+                let parent_rt = parent.runtime_dir.clone();
 
-            bridge_socket_if_present(
-                &mut extra_binds,
-                verbosity,
-                "pipewire",
-                &parent_rt.join("pipewire-0"),
-                &target_runtime.join("pipewire-0"),
-            );
+                if !target_has_working_socket(&target_pulse) {
+                    bridge_socket_if_present(
+                        &mut extra_binds,
+                        verbosity,
+                        "pulse",
+                        &parent_rt.join("pulse/native"),
+                        &target_pulse,
+                    );
+                } else if verbosity >= 2 {
+                    eprintln!(
+                        "proclet: gui: pulse: using target user socket at {}",
+                        target_pulse.display()
+                    );
+                }
+
+                if !target_has_working_socket(&target_pw) {
+                    bridge_socket_if_present(
+                        &mut extra_binds,
+                        verbosity,
+                        "pipewire",
+                        &parent_rt.join("pipewire-0"),
+                        &target_pw,
+                    );
+                } else if verbosity >= 2 {
+                    eprintln!(
+                        "proclet: gui: pipewire: using target user socket at {}",
+                        target_pw.display()
+                    );
+                }
+            }
         }
     } else {
         // --- X11 fallback (only if DISPLAY exists) ---
         if env_effective_has(env_pairs, "DISPLAY") {
-            // Bind /tmp/.X11-unix directory (X11 socket dir)
             bind_if_exists(
                 &mut extra_binds,
                 verbosity,
@@ -524,7 +1015,6 @@ pub fn prepare_desktop(
                 false,
             );
 
-            // Bind XAUTHORITY file if present (don’t force it; just support it).
             if let Some(xauth) = env_effective_get(env_pairs, "XAUTHORITY") {
                 let xauth_path = PathBuf::from(xauth);
                 if xauth_path.exists() {
@@ -543,9 +1033,6 @@ pub fn prepare_desktop(
                     );
                 }
             }
-
-            // We explicitly do NOT set DISPLAY here.
-            // If the host/inherited environment has DISPLAY, the payload will see it.
         } else if verbosity > 0 {
             log_error("gui: no live Wayland socket detected and no DISPLAY present; leaving GUI env untouched");
         }
@@ -564,10 +1051,6 @@ pub fn prepare_desktop(
     ensure_doc_mountpoint_best_effort(target_uid, &target_runtime, verbosity);
 
     // --- GPU integration (EGL/GBM/DRM) ---
-    // Bind GPU nodes and grant best-effort ACL so sandbox user can open them,
-    // even if supplementary groups are not preserved inside the user namespace.
-    //
-    // You can disable this with: PROCLET_GPU=0
     let gpu_mode = std::env::var("PROCLET_GPU").unwrap_or_else(|_| "1".to_string());
     if gpu_mode != "0" {
         bind_if_exists(
@@ -579,7 +1062,6 @@ pub fn prepare_desktop(
             false,
         );
 
-        // Optional NVIDIA nodes (best-effort)
         for dev in [
             "/dev/nvidia0",
             "/dev/nvidiactl",
@@ -605,14 +1087,10 @@ pub fn prepare_desktop(
             false,
         );
 
-        // ACL grants are best-effort and safe: they only widen access for the target uid.
         ensure_gpu_access_best_effort(target_uid, verbosity);
     } else if verbosity >= 2 {
         eprintln!("proclet: gui: gpu: disabled (PROCLET_GPU=0)");
     }
-
-    // Provide a session bus (best-effort).
-    maybe_wrap_dbus_run_session(cmd_vec, verbosity);
 
     extra_binds
 }

@@ -31,6 +31,8 @@ use std::{
     thread,
 };
 
+use crate::cli::DesktopBus;
+
 // ---------- feature gates as booleans ----------
 
 #[cfg(feature = "net")]
@@ -537,6 +539,15 @@ fn main() {
         cli.tmpfs_tmp,
         FEATURE_REACTOR,
     );
+
+    match cli.desktop_bus {
+    DesktopBus::Auto => {}
+    DesktopBus::Discover => env_pairs.push(("PROCLET_DBUS".into(), "discover".into())),
+    DesktopBus::Host => env_pairs.push(("PROCLET_DBUS".into(), "host".into())),
+    DesktopBus::Spawn => env_pairs.push(("PROCLET_DBUS".into(), "spawn".into())),
+    DesktopBus::Session => env_pairs.push(("PROCLET_DBUS".into(), "session".into())),
+    DesktopBus::Inherit => env_pairs.push(("PROCLET_DBUS".into(), "inherit".into())),
+    }
 
     if verbosity > 0 {
         print_summary(&cli, use_user, use_pid, use_mnt, use_net);

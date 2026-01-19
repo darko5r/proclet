@@ -757,14 +757,21 @@ pub fn run_pid_mount(argv: &[CString], opts: &ProcletOpts) -> Result<i32, Errno>
             }
         }
         ForkResult::Parent { child } => {
-            // --- Original process: wait for namespace init (PID1) to finish ---
-            v3!("outer parent waiting for init pid {}", child);
-            match waitpid(child, None)? {
-                WaitStatus::Exited(_, code) => Ok(code),
-                WaitStatus::Signaled(_, sig, _) => Ok(128 + sig as i32),
-                _ => Ok(1),
-            }
-        }
+    v3!("outer parent waiting for init pid {}", child);
+
+    let rc = match waitpid(child, None)? {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
+        _ => 1,
+    };
+
+    // Best-effort: stop spawned desktop bus (if any).
+    // (verbosity arg can be 0; it only affects logging)
+    crate::gui::cleanup_desktop_bus(0);
+
+    Ok(rc)
+       }
+
     }
 }
 

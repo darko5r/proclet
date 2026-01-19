@@ -28,6 +28,16 @@ pub enum Ns {
     Net,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DesktopBus {
+    Auto,
+    Discover,
+    Host,
+    Spawn,
+    Session,
+    Inherit,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "proclet", about = "Tiny Linux sandbox using namespaces")]
 pub struct Cli {
@@ -147,4 +157,11 @@ pub struct Cli {
     /// Example: --as-user 1000 to run a GUI app from root as uid 1000.
     #[arg(long = "as-user", value_name = "UID")]
     pub as_user: Option<u32>,
+
+    /// Desktop DBus handling mode for root->user GUI apps.
+    ///
+    /// - auto: try discover KDE bus, then /run/user/<uid>/bus, else dbus-run-session
+    /// - spawn: if missing, spawn a user bus at /run/user/<uid>/bus and keep it alive
+    #[arg(long = "desktop-bus", value_enum, default_value_t = DesktopBus::Auto)]
+    pub desktop_bus: DesktopBus,
 }
